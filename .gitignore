@@ -1,0 +1,18 @@
+# Виртуальное окружение, которое создаёт run.bat  
+.venv/  
+venv/  
+  
+# Кэш Python  
+__pycache__/  
+*.py[cod]  
+  
+# Результаты выгрузки и временные файлы  
+*.xlsx  
+~$*.xlsx  
+*.download  
+*.log  
+  
+# Сборка exe (PyInstaller)  
+build/  
+dist/  
+*.spec

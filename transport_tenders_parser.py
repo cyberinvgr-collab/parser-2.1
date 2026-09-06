@@ -1,0 +1,2610 @@
+# -*- coding: utf-8 -*-
+"""Оконное приложение для мониторинга закупок автомобильных перевозок.
+Источник: открытая часть ЕИС (44-ФЗ и 223-ФЗ), включая ссылки на ЭТП.
+"""
+from __future__ import annotations
+
+import html
+import io
+import math
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import webbrowser
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Callable
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs, unquote
+import xml.etree.ElementTree as ET
+
+APP_NAME = "Транспортные закупки — ЕИС и ТЭК-Торг"
+APP_VERSION = "1.13.0"
+MIN_PYTHON = (3, 10)  # playwright поддерживает только Python 3.10 и новее
+
+
+def _app_data_dir() -> Path:
+    """Папка для журнала ошибок и профилей браузера: %LOCALAPPDATA% на Windows."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "TransportTenderParser"
+
+
+def _error_log_path() -> Path:
+    return _app_data_dir() / "error.log"
+
+
+def _log_exception(context: str, exc_type, exc_value, exc_tb) -> str:
+    """Дописывает traceback в error.log и возвращает путь к нему (или пустую строку)."""
+    try:
+        path = _error_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now():%d.%m.%Y %H:%M:%S} | {APP_NAME} {APP_VERSION} | "
+                     f"Python {sys.version.split()[0]} | {context}\n")
+            fh.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+        return str(path)
+    except Exception:
+        return ""
+
+# Соответствие «имя модуля при импорте» → «имя пакета для pip». Нужно, чтобы
+# при отсутствии зависимости показать пользователю точную команду установки.
+# Все пакеты обязательны: без pypdf не читается PDF-документация, без
+# playwright нельзя обойти антибот-защиту ТЭК-Торг через браузер.
+REQUIRED_PACKAGES = {
+    "requests": "requests",
+    "bs4": "beautifulsoup4",
+    "openpyxl": "openpyxl",
+    "pypdf": "pypdf",
+    "playwright": "playwright",
+}
+
+
+def _fail_startup(message: str) -> None:
+    """Показывает причину сбоя запуска и завершает программу.
+
+    Без этой функции ошибка на этапе импорта на Windows выглядит как
+    «окно мелькнуло и закрылось». Сообщение выводится во всплывающем окне
+    (Tkinter есть в стандартной поставке Python для Windows), а если и его
+    нет — печатается в консоль, которая не закрывается до нажатия Enter.
+    """
+    shown = False
+    try:
+        path = _error_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n===== {datetime.now():%d.%m.%Y %H:%M:%S} | {APP_NAME} {APP_VERSION} | "
+                     f"Python {sys.version.split()[0]} | Сбой запуска\n{message}\n")
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _root = _tk.Tk()
+        _root.withdraw()
+        _mb.showerror(APP_NAME, message)
+        _root.destroy()
+        shown = True
+    except Exception:
+        pass
+    try:
+        sys.stderr.write("\n" + message + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    if not shown and sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input("Нажмите Enter для выхода…")
+        except Exception:
+            pass
+    raise SystemExit(1)
+
+
+if sys.version_info < MIN_PYTHON:
+    _fail_startup(
+        f"Требуется Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} или новее, "
+        f"а запущен Python {sys.version.split()[0]}.\n\n"
+        "Установите актуальную версию с https://www.python.org/downloads/windows/ "
+        "и запустите программу через run.bat."
+    )
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from pypdf import PdfReader
+    from playwright.sync_api import sync_playwright
+except ImportError as _exc:
+    _missing = REQUIRED_PACKAGES.get((_exc.name or "").split(".")[0], _exc.name or "?")
+    _fail_startup(
+        f"Не установлена библиотека «{_missing}», без неё программа не запускается.\n\n"
+        "Самый простой способ исправить — запустить файл run.bat из папки программы: "
+        "он сам установит всё необходимое.\n\n"
+        "Либо выполните в командной строке:\n"
+        f"    {Path(sys.executable).name} -m pip install -r requirements.txt\n\n"
+        f"Подробности: {_exc}"
+    )
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+except ImportError:
+    _fail_startup(
+        "Не найден Tkinter — библиотека для оконного интерфейса.\n\n"
+        "Установите стандартную версию Python для Windows с сайта python.org "
+        "(в установщике должен быть отмечен компонент «tcl/tk and IDLE», он включён по умолчанию)."
+    )
+
+EIS = "https://zakupki.gov.ru"
+
+# Документация закупки может быть довольно большой. Ограничения защищают
+# поиск от случайной загрузки видео, архивов с большим количеством файлов и
+# бесконечно повторяющихся ссылок площадки.
+MAX_DOCUMENTS_TO_SCAN = 8
+MAX_DOCUMENT_SIZE = 20 * 1024 * 1024
+DOCUMENT_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm", ".csv", ".txt", ".rtf",
+    ".odt", ".ods", ".zip", ".html", ".htm", ".xml",
+}
+DOCUMENT_LINK_HINT_RE = re.compile(
+    r"(документ|документац|техническ|техзадан|техническое задание|"
+    r"спецификац|характеристик|описани[ея] объекта|требован|"
+    r"транспорт|автомобил|автобус|скачать|загрузить|download|"
+    r"attachment|document|filestore|файл)", re.I,
+)
+VEHICLE_CONTEXT_RE = re.compile(
+    r"(транспортн\w*\s+средств\w*|автомобил\w*|автобус\w*|"
+    r"микроавтобус\w*|грузовик\w*|самосвал\w*|тягач\w*|фургон\w*|"
+    r"рефрижератор\w*|цистерн\w*|манипулятор\w*|эвакуатор\w*|"
+    r"погрузчик\w*|экскаватор\w*|бульдозер\w*|грейдер\w*|каток\w*|"
+    r"кран\w*|под(?:ъ|ь)?[её]мник\w*|трактор\w*|машин\w*|"
+    r"легков\w*|пикап\w*|внедорожник\w*|кроссовер\w*|седан\w*|"
+    r"универсал\w*|хэтчбек\w*|лифтбек\w*|минивэн\w*|"
+    r"прицеп\w*|полуприцеп\w*|трал\w*|платформ\w*|спецтехник\w*|"
+    r"марка|модель|тип\s+транспорт)",
+    re.I,
+)
+VEHICLE_FIELD_RE = re.compile(
+    r"(?:марка\s*(?:и\s*модель|[,/]\s*модель)?|марка\s*/\s*модель|"
+    r"модель\s+(?:автомобил\w*|автобус\w*|транспортн\w*\s+средств\w*|ТС)|"
+    r"наименование\s+(?:транспортн\w*\s+средств\w*|автомобил\w*|автобус\w*|ТС)|"
+    r"вид\s+транспортн\w*\s+средств\w*|тип\s+(?:транспортн\w*\s+средств\w*|ТС))"
+    r"\s*(?:[:№=\-–—]\s*|\s{1,3})([^\n;|]{2,180})",
+    re.I,
+)
+VEHICLE_CODE_RE = re.compile(
+    r"(?<![\w])(?:[А-ЯЁA-Z]{2,7}[-\s]?\d{2,5}(?:[-/]\d{1,5})?(?:[-/][А-ЯЁA-Z0-9]{1,8})?)(?![\w])",
+    re.I,
+)
+# Эти сочетания похожи на модель по форме «слово + число», но на деле чаще
+# являются ГОСТ/ISO, годом, размером или фрагментом требования.
+NON_VEHICLE_CODE_PREFIXES = {
+    "iso", "гост", "гостр", "сто", "ту", "снип", "сп", "en", "din", "ост", "рд",
+    "мэк", "мр", "мп", "мо", "тс", "ii", "iii", "iv", "vi", "vii", "сектора",
+    "менее", "более", "на", "до", "от", "не", "для", "при", "по", "из", "с", "и",
+    "или", "код", "номер", "класс", "стандарт", "стандарта", "год", "года", "мест",
+    "мощность", "масса", "груз", "объем", "объём", "ширина", "высота", "длина", "размер",
+    "степень", "пункт", "раздел", "часть", "срок", "состав", "режим", "уровень", "свыше",
+    "около", "кг", "мм", "см", "квт", "руб",
+}
+VEHICLE_BRAND_RE = re.compile(
+    r"(?<![\w])(?:КамАЗ|КАМАЗ|МАЗ|ПАЗ|ЛиАЗ|ЛАЗ|НЕФАЗ|НефАЗ|КАвЗ|"
+    r"ГАЗель|ГАЗ|УАЗ|ВАЗ|Лада|УРАЛ|Урал|ЗИЛ|Тонар|Богдан|Вектор|"
+    r"Ford|Форд|Mercedes(?:-Benz)?|Мерседес|Iveco|IVECO|MAN|Scania|"
+    r"Volvo|DAF|Renault|Рено|Peugeot|Пежо|Fiat|Фиат|Volkswagen|"
+    r"Фольксваген|Hyundai|Хендай|Hino|Isuzu|Toyota|Mitsubishi|Kia|"
+    r"Setra|Yutong|Citroen|Ситроен|Nissan|Ниссан|Lexus|Лексус|Subaru|"
+    r"Suzuki|Honda|Mazda|Skoda|Шкода|Geely|Джили|Chery|Чери|Haval|"
+    r"Hawtai|Exeed|Москвич|Нива|Niva|ГАЗ-\w+)",
+    re.I,
+)
+VEHICLE_MODEL_WORDS = {
+    "transit", "sprinter", "daily", "county", "patriot", "profi", "granta", "sable",
+    "next", "porter", "caddy", "crafter", "master", "ducato", "fh", "fm",
+    "cruiser", "hiace", "hilux", "tundra", "land", "vesta", "largus", "niva",
+    "travel", "hunter", "хантэр", "хантер", "патриот", "профи", "буханка", "карго",
+    "фермер", "калина", "веста", "ларгус", "солярис", "крета", "рио", "октавия",
+    "рапид", "логан", "дастер", "каптур", "тигуан", "поло",
+}
+GENERIC_VEHICLE_RE = re.compile(
+    r"\b(?:фронтальн\w*\s+погрузчик\w*|вилочн\w*\s+погрузчик\w*|"
+    r"грузов\w*\s+автомобил\w*|легков\w*\s+автомобил\w*|"
+    r"легков\w*\s+транспорт\w*|пикап\w*|внедорожник\w*|кроссовер\w*|"
+    r"седан\w*|универсал\w*|хэтчбек\w*|лифтбек\w*|минивэн\w*|"
+    r"тягач\w*\s+седельн\w*|седельн\w*\s+тягач\w*|сед\.?\s+тягач\w*|тягач\w*|"
+    r"автогидропод[ъь]?[её]мник\w*|автогрейдер\w*|грейдер\w*|"
+    r"гидравлическ\w*\s+дорожн\w*\s+каток\w*|дорожн\w*\s+каток\w*|каток\w*|"
+    r"экскаватор\w*\s+гусенич\w*|экскаватор\w*|"
+    r"бульдозер\w*\s+гусенич\w*|бульдозер\w*|"
+    r"автомобильн\w*\s+кран\w*|кран\w*|погрузчик\w*|"
+    r"автобус\w*|микроавтобус\w*|самосвал\w*|фургон\w*|рефрижератор\w*|"
+    r"автоцистерн\w*|цистерн\w*|манипулятор\w*|эвакуатор\w*|трактор\w*|трал\w*|"
+    r"низкорамн\w*\s+платформ\w*|полуприцеп\w*|прицеп\w*|"
+    r"грузовой\s+автомобил\w*|легковой\s+автомобил\w*)\b",
+    re.I,
+)
+RSS_URL = EIS + "/epz/order/extendedsearch/rss.html"
+
+DEFAULT_KEYWORDS = [
+    "перевозка грузов", "грузоперевозки", "автотранспортные услуги",
+    "транспортные услуги", "пассажирские перевозки", "перевозка пассажиров",
+    "легковой транспорт", "легковые автомобили", "автомобиль легковой",
+    "пикап", "внедорожник", "УАЗ Патриот", "УАЗ Профи",
+    "вахтовые перевозки", "фрахтование", "аренда спецтехники",
+    "услуги спецтехники", "аренда грузового транспорта с водителем",
+    "аренда автобуса с водителем", "аренда автомобиля с экипажем",
+    "седельный тягач", "седельные тягачи", "трал", "тралы",
+    "низкорамная платформа", "полуприцеп", "полуприцепы", "прицеп",
+]
+
+SUPPLIER_CATEGORY = "Исполнитель услуг (собственными силами)"
+
+# Коды, предоставленные пользователем, плюс пассажирские коды, необходимые
+# для заявленной области специализации.
+OKVED2_CODES = {
+    "49.41.1": "Перевозка грузов специализированными автотранспортными средствами",
+    "49.41.2": "Перевозка грузов неспециализированными автотранспортными средствами",
+    "49.41.3": "Аренда грузового автомобильного транспорта с водителем",
+    "49.42": "Предоставление услуг по перевозкам",
+    "49.31.21": "Регулярные внутригородские и пригородные пассажирские перевозки автобусами",
+    "49.39.31": "Аренда городских и междугородных автобусов с водителем",
+    "49.39.33": "Перевозка пассажиров автобусами по заказам в городском и пригородном сообщении",
+    "49.39.34": "Перевозка пассажиров автобусами по заказам в междугородном и международном сообщении",
+}
+
+OKPD2_CODES = {
+    "49.41.14.000": "Услуги по перевозке автомобильным транспортом грузов в контейнерах",
+    "49.41.15.000": "Услуги по перевозке автомобильным транспортом сухих сыпучих грузов",
+    "49.41.18.000": "Услуги по перевозке автомобильным транспортом писем и бандеролей",
+    "49.41.20.000": "Услуги по аренде грузовых транспортных средств с водителем",
+    "49.39.31.000": "Услуги арендованных автобусов с водителем",
+    "49.39.33.000": "Услуги по перевозке пассажиров автобусами по заказам в городском и пригородном сообщении",
+    "49.39.34.000": "Услуги по перевозке пассажиров и багажа автобусами по заказам в междугородном и международном сообщении",
+    "49.39.39.000": "Услуги по перевозке пассажиров сухопутным транспортом прочие",
+}
+EXCLUDE_RE = re.compile(
+    r"\b(железнодорож|авиацион|воздушн(?:ым|ого)? транспорт|морск(?:ая|ие|им)|"
+    r"речн(?:ая|ые|ым)|водн(?:ым|ого) транспорт|трубопровод|багаж авиапассажир|"
+    r"почтов(?:ая|ые) пересыл)\w*", re.I
+)
+ROAD_RE = re.compile(
+    r"(автомобил|автотранспорт|автобус|микроавтобус|легков|пикап|внедорожник|"
+    r"кроссовер|грузоперевоз|перевозк|транспортировк|тягач|седельн\w*.{0,20}тягач|"
+    r"трал\w*|полуприцеп\w*|прицеп\w*|низкорамн\w*.{0,20}платформ|"
+    r"фрахтован|спецтехник|аренд\w*.{0,40}(?:водител|экипаж|автобус|грузов)|"
+    r"доставк.{0,25}(?:работник|персонал|груз)|вахтов|экспедиц|такси|"
+    r"транспортн.{0,20}(?:обслужив|услуг))",
+    re.I | re.S,
+)
+TRANSPORT_PRODUCT_RE = re.compile(r"\bпоставк\w*.{0,80}\b(?:для|в целях)\s+перевозк", re.I | re.S)
+
+REGIONS = {
+    "Все регионы": "",
+    "Республика Адыгея": "01", "Республика Башкортостан": "02", "Республика Бурятия": "03",
+    "Республика Алтай": "04", "Республика Дагестан": "05", "Республика Ингушетия": "06",
+    "Кабардино-Балкарская Республика": "07", "Республика Калмыкия": "08",
+    "Карачаево-Черкесская Республика": "09", "Республика Карелия": "10", "Республика Коми": "11",
+    "Республика Марий Эл": "12", "Республика Мордовия": "13", "Республика Саха (Якутия)": "14",
+    "Республика Северная Осетия — Алания": "15", "Республика Татарстан": "16", "Республика Тыва": "17",
+    "Удмуртская Республика": "18", "Республика Хакасия": "19", "Чеченская Республика": "20",
+    "Чувашская Республика": "21", "Алтайский край": "22", "Краснодарский край": "23",
+    "Красноярский край": "24", "Приморский край": "25", "Ставропольский край": "26",
+    "Хабаровский край": "27", "Амурская область": "28", "Архангельская область": "29",
+    "Астраханская область": "30", "Белгородская область": "31", "Брянская область": "32",
+    "Владимирская область": "33", "Волгоградская область": "34", "Вологодская область": "35",
+    "Воронежская область": "36", "Ивановская область": "37", "Иркутская область": "38",
+    "Калининградская область": "39", "Калужская область": "40", "Камчатский край": "41",
+    "Кемеровская область — Кузбасс": "42", "Кировская область": "43", "Костромская область": "44",
+    "Курганская область": "45", "Курская область": "46", "Ленинградская область": "47",
+    "Липецкая область": "48", "Магаданская область": "49", "Московская область": "50",
+    "Мурманская область": "51", "Нижегородская область": "52", "Новгородская область": "53",
+    "Новосибирская область": "54", "Омская область": "55", "Оренбургская область": "56",
+    "Орловская область": "57", "Пензенская область": "58", "Пермский край": "59",
+    "Псковская область": "60", "Ростовская область": "61", "Рязанская область": "62",
+    "Самарская область": "63", "Саратовская область": "64", "Сахалинская область": "65",
+    "Свердловская область": "66", "Смоленская область": "67", "Тамбовская область": "68",
+    "Тверская область": "69", "Томская область": "70", "Тульская область": "71",
+    "Тюменская область": "72", "Ульяновская область": "73", "Челябинская область": "74",
+    "Забайкальский край": "75", "Ярославская область": "76", "Москва": "77",
+    "Санкт-Петербург": "78", "Еврейская автономная область": "79",
+    "Донецкая Народная Республика": "80", "Луганская Народная Республика": "81",
+    "Республика Крым": "82", "Ненецкий автономный округ": "83", "Херсонская область": "84",
+    "Запорожская область": "85", "Ханты-Мансийский АО — Югра": "86",
+    "Чукотский автономный округ": "87", "Ямало-Ненецкий автономный округ": "89",
+    "Севастополь": "92", "Иные территории, включая Байконур": "99",
+}
+CODE_TO_REGION = {v: k for k, v in REGIONS.items() if v}
+
+@dataclass
+class Tender:
+    number: str = ""
+    title: str = ""
+    nmck: float | None = None
+    published: str = ""
+    deadline: str = ""
+    region: str = ""
+    customer: str = ""
+    law: str = ""
+    status: str = ""
+    procedure: str = ""
+    okved2: str = ""
+    okpd2: str = ""
+    supplier_category: str = ""
+    etp: str = ""
+    etp_url: str = ""
+    eis_url: str = ""
+    matched_keyword: str = ""
+    transport: str = ""
+    documentation_url: str = ""
+
+
+@dataclass(frozen=True)
+class DocumentLink:
+    url: str
+    label: str = ""
+
+
+def clean_text(value: str | None) -> str:
+    if not value:
+        return ""
+    value = html.unescape(str(value))
+    if "<" in value and ">" in value:
+        value = BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_date(value: str) -> str:
+    value = clean_text(value)
+    m = re.search(r"(\d{2}\.\d{2}\.\d{4})(?:\s+(\d{1,2}:\d{2}))?", value)
+    return (m.group(1) + ((" " + m.group(2)) if m.group(2) else "")) if m else value
+
+
+def parse_price(value: str) -> float | None:
+    m = re.search(r"\d[\d\s\u00a0.,]*", clean_text(value))
+    if not m:
+        return None
+    raw = m.group(0).replace(" ", "").replace("\u00a0", "").rstrip(".,")
+    try:
+        if "," in raw and "." in raw:
+            # Последний разделитель считаем десятичным, второй — разделителем тысяч.
+            decimal = "," if raw.rfind(",") > raw.rfind(".") else "."
+            thousands = "." if decimal == "," else ","
+            raw = raw.replace(thousands, "").replace(decimal, ".")
+        elif raw.count(",") + raw.count(".") == 1:
+            sep = "," if "," in raw else "."
+            tail = raw.split(sep)[-1]
+            raw = raw.replace(sep, "" if len(tail) == 3 else ".")
+        else:
+            raw = raw.replace(",", "").replace(".", "")
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def description_field(desc_html: str, label: str) -> str:
+    text = clean_text(desc_html)
+    pattern = re.escape(label) + r"\s*:?\s*(.*?)(?=(?:Наименование объекта закупки|Размещение выполняется по|Наименование Заказчика|Начальная цена контракта|Валюта|Размещено|Обновлено|Этап размещения|Идентификационный код закупки)\s*:|$)"
+    m = re.search(pattern, text, re.I | re.S)
+    return clean_text(m.group(1)) if m else ""
+
+
+def get_reg_number(url: str, title: str = "") -> str:
+    q = parse_qs(urlparse(url).query)
+    if q.get("regNumber"):
+        return q["regNumber"][0]
+    nums = re.findall(r"\b\d{10,25}\b", title)
+    return nums[-1] if nums else ""
+
+
+def parse_rss(xml_bytes: bytes, keyword: str) -> list[Tender]:
+    root = ET.fromstring(xml_bytes)
+    rows: list[Tender] = []
+    for item in root.findall(".//item"):
+        title_raw = item.findtext("title", "")
+        link = clean_text(item.findtext("link", ""))
+        desc = item.findtext("description", "") or ""
+        obj = description_field(desc, "Наименование объекта закупки")
+        customer = description_field(desc, "Наименование Заказчика") or clean_text(item.findtext("author", ""))
+        law = description_field(desc, "Размещение выполняется по")
+        price = description_field(desc, "Начальная цена контракта")
+        published = description_field(desc, "Размещено")
+        status = description_field(desc, "Этап размещения")
+        if not published:
+            try:
+                published = parsedate_to_datetime(item.findtext("pubDate", "")).strftime("%d.%m.%Y")
+            except Exception:
+                pass
+        object_title = obj if obj.lower() != "null" else clean_text(title_raw)
+        rows.append(Tender(
+            number=get_reg_number(link, title_raw), title=object_title,
+            transport=extract_transport_name(object_title), nmck=parse_price(price),
+            published=normalize_date(published), customer=customer,
+            law=law, status=status, procedure=re.sub(r"\s*№\s*\d+\s*$", "", clean_text(title_raw)),
+            eis_url=link, matched_keyword=keyword,
+        ))
+    return rows
+
+
+def nearby_value(soup: BeautifulSoup, labels: list[str]) -> str:
+    """Ищет значение рядом с подписью; устойчиво к нескольким вариантам верстки ЕИС."""
+    for label in labels:
+        node = soup.find(string=lambda s: bool(s and label.lower() in clean_text(s).lower()))
+        if not node:
+            continue
+        el = node.parent
+        # Сначала соседние блоки текущей подписи.
+        for candidate in [el.find_next_sibling(), el.parent.find_next_sibling() if el.parent else None]:
+            if candidate:
+                value = clean_text(candidate.get_text(" ", strip=True))
+                if value and label.lower() not in value.lower():
+                    return value
+        # Затем ближайший контейнер и элементы со стандартными классами ЕИС.
+        container = el.find_parent(["div", "td", "tr", "section"])
+        if container:
+            for selector in [".section__info", ".common-text__value", ".cardMainInfo__content", ".col"]:
+                vals = container.select(selector)
+                for val in vals:
+                    value = clean_text(val.get_text(" ", strip=True))
+                    if value and label.lower() not in value.lower():
+                        return value
+    return ""
+
+
+def _document_extension(url: str, label: str = "") -> str:
+    """Возвращает расширение файла с учетом URL с query-параметрами."""
+    for value in (urlparse(url).path, label):
+        suffix = Path(unquote(value)).suffix.lower()
+        if suffix in DOCUMENT_EXTENSIONS:
+            return suffix
+    return ""
+
+
+def _document_url_candidates(raw: str) -> list[str]:
+    """Извлекает URL из href, data-* и простых javascript-обработчиков."""
+    if not raw:
+        return []
+    raw = html.unescape(str(raw)).replace("\\/", "/").strip()
+    if raw.startswith(("http://", "https://", "/", "//")):
+        return [raw.strip("'\\\"()[]{}")]
+    return [x.strip("'\\\"()[]{}") for x in re.findall(
+        r"(?:(?:https?:)?//|/)[^'\"<>\s)]+", raw, re.I
+    )]
+
+
+def find_document_links(page: bytes | str, base_url: str) -> list[DocumentLink]:
+    """Находит открытые файлы документации на странице карточки закупки.
+
+    У ЕИС и ЭТП ссылки встречаются как обычный href, data-* атрибут или URL
+    внутри обработчика кнопки «Скачать», поэтому проверяются все три варианта.
+    Возвращаются только ссылки с признаками файла/документа — ссылки на меню,
+    карточку и внешнюю площадку в список не попадают.
+    """
+    raw_page = page.decode("utf-8", errors="ignore") if isinstance(page, bytes) else str(page)
+    soup = BeautifulSoup(raw_page, "html.parser")
+    scored: dict[str, tuple[int, str]] = {}
+
+    def add(raw_url: str, label: str = ""):
+        raw_url = html.unescape(raw_url).replace("\\/", "/").strip()
+        if not raw_url or raw_url.lower().startswith(("javascript:", "mailto:", "data:", "#")):
+            return
+        url = urljoin(base_url, raw_url.strip("'\\\"()[]{}"))
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return
+        label = clean_text(label)
+        path = unquote(parsed.path).lower()
+        blob = f"{path} {parsed.query.lower()} {label.lower()}"
+        ext = _document_extension(url, label)
+        hint = bool(DOCUMENT_LINK_HINT_RE.search(blob))
+        file_route = bool(re.search(r"(filestore|attachment|document|download|file|upload)", blob, re.I))
+        # Для HTML оставляем только разделы документов или явно обозначенную
+        # кнопку скачивания; common-info.html и соседние страницы не скачиваем.
+        if ext not in DOCUMENT_EXTENSIONS and not hint and not file_route:
+            return
+        if ext in {".html", ".htm"} and not file_route and not re.search(
+            r"(документ|document|download|скачать|файл)", blob, re.I
+        ):
+            return
+        if not ext and not (hint or file_route):
+            return
+        score = 0
+        if ext:
+            score += 8
+        if file_route:
+            score += 6
+        if hint:
+            score += 4
+        if re.search(r"(техническ|техзадан|спецификац|характеристик|транспорт|автомобил|автобус)", blob, re.I):
+            score += 3
+        previous = scored.get(url)
+        if previous is None or score > previous[0]:
+            scored[url] = (score, label)
+
+    attrs = ("href", "data-href", "data-url", "data-file-url", "data-download-url", "onclick")
+    for tag in soup.find_all(True):
+        label_parts = [tag.get_text(" ", strip=True), tag.get("title", ""), tag.get("download", "")]
+        label = " ".join(str(x) for x in label_parts if x)
+        for attr in attrs:
+            value = tag.get(attr)
+            if isinstance(value, (list, tuple)):
+                value = " ".join(str(x) for x in value)
+            for token in _document_url_candidates(str(value or "")):
+                add(token, label)
+
+    # Часть ссылок ЕИС отрисовывается из JSON/JavaScript и отсутствует в href.
+    for token in re.findall(r"(?:(?:https?:)?//|/)[^'\"<>\s]+", raw_page, re.I):
+        add(token, "")
+
+    ordered = sorted(scored.items(), key=lambda item: (-item[1][0], item[0]))
+    return [DocumentLink(url=url, label=label) for url, (_, label) in ordered[:MAX_DOCUMENTS_TO_SCAN]]
+
+
+def _normalize_document_text(value: str) -> str:
+    value = html.unescape(value or "").replace("\x00", " ").replace("\r", "\n")
+    value = re.sub(r"[ \t\f\v]+", " ", value)
+    value = re.sub(r"\n[ \t]+", "\n", value)
+    return re.sub(r"\n{3,}", "\n\n", value).strip()
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _xml_text_with_breaks(data: bytes) -> str:
+    try:
+        root = ET.fromstring(data)
+    except (ET.ParseError, ValueError):
+        return ""
+    chunks: list[str] = []
+    for element in root.iter():
+        name = _xml_local_name(element.tag)
+        if name in {"t", "instrtext", "v", "text", "p", "h", "tab", "br", "cr"}:
+            if name in {"p", "h", "br", "cr"}:
+                chunks.append("\n")
+            elif name == "tab":
+                chunks.append("\t")
+            elif element.text:
+                chunks.append(element.text)
+    return _normalize_document_text("".join(chunks))
+
+
+def _extract_docx_text(data: bytes) -> str:
+    chunks = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = [name for name in archive.namelist() if name.startswith("word/") and name.endswith(".xml")]
+            for name in sorted(names):
+                if not re.search(r"word/(document|header|footer|footnotes|endnotes)\d*\.xml$", name, re.I):
+                    continue
+                chunks.append(_xml_text_with_breaks(archive.read(name)))
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return ""
+    return _normalize_document_text("\n".join(chunks))
+
+
+def _extract_xlsx_text(data: bytes) -> str:
+    """Читает текстовые ячейки XLSX без зависимости от версии openpyxl."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root.iter():
+                    if _xml_local_name(item.tag) == "si":
+                        shared.append(_normalize_document_text("".join(item.itertext())))
+            chunks = []
+            for name in archive.namelist():
+                if not re.match(r"xl/worksheets/[^/]+\.xml$", name, re.I):
+                    continue
+                root = ET.fromstring(archive.read(name))
+                for row in root.iter():
+                    if _xml_local_name(row.tag) != "row":
+                        continue
+                    values = []
+                    for cell in row:
+                        if _xml_local_name(cell.tag) != "c":
+                            continue
+                        cell_type = cell.attrib.get("t", "")
+                        value_node = next((child for child in cell if _xml_local_name(child.tag) in {"v", "t", "is"}), None)
+                        if value_node is None:
+                            continue
+                        value = "".join(value_node.itertext()).strip()
+                        if cell_type == "s":
+                            try:
+                                value = shared[int(value)]
+                            except (ValueError, IndexError):
+                                pass
+                        values.append(value)
+                    if values:
+                        chunks.append(" | ".join(values))
+            return _normalize_document_text("\n".join(chunks))
+    except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError):
+        return ""
+
+
+def _extract_zip_documents(data: bytes, depth: int = 0) -> str:
+    if depth > 1:
+        return ""
+    chunks = []
+    total_size = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for info in archive.infolist()[:40]:
+                if info.is_dir() or info.file_size > MAX_DOCUMENT_SIZE:
+                    continue
+                if total_size + info.file_size > MAX_DOCUMENT_SIZE:
+                    break
+                suffix = Path(info.filename).suffix.lower()
+                if suffix not in DOCUMENT_EXTENSIONS or suffix == ".zip":
+                    continue
+                try:
+                    member = archive.read(info)
+                    total_size += len(member)
+                    chunks.append(extract_document_text(member, info.filename, depth + 1))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+    except (zipfile.BadZipFile, OSError):
+        return ""
+    return _normalize_document_text("\n".join(x for x in chunks if x))
+
+
+def _extract_rtf_text(data: bytes) -> str:
+    text = data.decode("cp1251", errors="ignore")
+    text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
+    text = re.sub(r"\\(?:par|line)\b", "\n", text, flags=re.I)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", text)
+    return _normalize_document_text(text.replace("{", "").replace("}", ""))
+
+
+MAX_PDF_PAGES = 60
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    """Читает текстовый слой PDF через pypdf.
+
+    Площадки часто выкладывают PDF с «защитой от копирования» — файл
+    зашифрован пустым паролем пользователя. Такие документы расшифровываются
+    прозрачно. Файлы с настоящим паролем и сканы без текстового слоя
+    возвращают пустую строку и не прерывают поиск.
+    """
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        if reader.is_encrypted:
+            try:
+                if reader.decrypt("") == 0:
+                    return ""
+            except Exception:
+                return ""
+        chunks: list[str] = []
+        for index, page in enumerate(reader.pages):
+            if index >= MAX_PDF_PAGES:
+                break
+            try:
+                chunks.append(page.extract_text() or "")
+            except Exception:
+                # Повреждённая страница не должна обнулять остальной документ.
+                continue
+        return _normalize_document_text("\n".join(chunks))
+    except Exception:
+        return ""
+
+
+def extract_document_text(data: bytes, name: str = "", depth: int = 0) -> str:
+    """Извлекает текст из PDF/DOCX/XLSX/RTF/HTML и обычных файлов.
+
+    Сканированные PDF и старый бинарный DOC без текстового слоя намеренно не
+    обрабатываются: для них нужен OCR/Word, который нельзя надежно включать в
+    переносимую Windows-версию. В остальных случаях отсутствие одного формата
+    не останавливает выгрузку — функция возвращает пустую строку.
+    """
+    if not data or len(data) > MAX_DOCUMENT_SIZE:
+        return ""
+    lower_name = unquote(str(name)).lower()
+    suffix = Path(urlparse(lower_name).path).suffix.lower()
+    if data.startswith(b"%PDF") or suffix == ".pdf":
+        return _extract_pdf_text(data)
+    if data[:2] == b"PK" or suffix in {".docx", ".docm", ".xlsx", ".xlsm", ".odt", ".ods", ".zip"}:
+        zip_names: set[str] = set()
+        if data[:2] == b"PK":
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    zip_names = set(archive.namelist())
+            except (zipfile.BadZipFile, OSError):
+                zip_names = set()
+        is_docx = suffix in {".docx", ".docm"} or any(name.startswith("word/") for name in zip_names)
+        is_xlsx = suffix in {".xlsx", ".xlsm"} or any(name.startswith("xl/worksheets/") for name in zip_names)
+        if is_docx:
+            text = _extract_docx_text(data)
+        elif is_xlsx:
+            text = _extract_xlsx_text(data)
+        elif suffix in {".odt", ".ods"} or "content.xml" in zip_names:
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    text = _xml_text_with_breaks(archive.read("content.xml"))
+            except (zipfile.BadZipFile, KeyError, OSError):
+                text = ""
+        else:
+            text = _extract_zip_documents(data, depth)
+        return _normalize_document_text(text)
+    if suffix == ".rtf":
+        return _extract_rtf_text(data)
+    if suffix in {".html", ".htm"} or b"<html" in data[:1000].lower():
+        return _normalize_document_text(BeautifulSoup(data, "html.parser").get_text("\n", strip=True))
+    if suffix == ".doc":
+        # Для старого DOC иногда удается найти строки, сохраненные в Unicode.
+        text = data.decode("utf-16", errors="ignore") if b"\x00" in data else data.decode("cp1251", errors="ignore")
+        text = re.sub(r"[^\w\s.,:;()/\\№-]", " ", text, flags=re.UNICODE)
+        return _normalize_document_text(text) if len(text.strip()) > 20 else ""
+    if b"\x00" in data[:4096] and suffix not in {".txt", ".csv", ".xml"}:
+        return ""
+    for encoding in ("utf-8-sig", "cp1251", "latin-1"):
+        try:
+            return _normalize_document_text(data.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+def _trim_vehicle_candidate(value: str) -> str:
+    value = _normalize_document_text(value)
+    value = re.sub(r"^\s*(?:[-–—:;.]|\d+[.)])\s*", "", value)
+    value = re.split(r"\s*[;|]\s*", value, maxsplit=1)[0]
+    value = re.split(
+        r"\s+(?:кол(?:ичество)?|кол-во|единиц\w*|шт\.?|год\s+выпуск\w*|"
+        r"гос(?:ударственн\w*)?\s*(?:номер|№)|VIN|мощност\w*|вместимост\w*)\b",
+        value, maxsplit=1, flags=re.I,
+    )[0]
+    value = value.strip(" \t,.:–—-()")
+    if len(value) > 160:
+        value = re.split(r"\s*[.!?]\s*", value, maxsplit=1)[0]
+    return value[:160].strip()
+
+
+def _vehicle_key(value: str) -> str:
+    return re.sub(r"[^\wа-яё]+", "", value.casefold())
+
+
+def _has_specific_vehicle(value: str) -> bool:
+    return bool(VEHICLE_CODE_RE.search(value) or VEHICLE_BRAND_RE.search(value))
+
+
+def _contains_non_vehicle_code(value: str) -> bool:
+    for match in VEHICLE_CODE_RE.finditer(value):
+        prefix_match = re.match(r"[А-ЯЁA-Z]+", match.group(0), re.I)
+        if prefix_match and prefix_match.group(0).casefold() in NON_VEHICLE_CODE_PREFIXES:
+            return True
+    return False
+
+
+def _add_vehicle_candidate(candidates: dict[str, tuple[int, str]], value: str, score: int):
+    value = _trim_vehicle_candidate(value)
+    if _contains_non_vehicle_code(value):
+        return
+    if len(value) < 2 or not VEHICLE_CONTEXT_RE.search(value) and not _has_specific_vehicle(value):
+        return
+    key = _vehicle_key(value)
+    if not key:
+        return
+    old = candidates.get(key)
+    if old is None or score > old[0] or (score == old[0] and len(value) > len(old[1])):
+        candidates[key] = (score, value)
+
+
+def _vehicle_model_after_brand(text: str, end: int) -> str:
+    tail = text[end:end + 70]
+    tail = re.sub(r"^\s*[|,:;\-–—/]\s*(?:марка|модель|тип)\s*[|,:;\-–—/]?\s*", " ", tail, flags=re.I)
+    model = re.match(
+        r"\s*(?:[-/|,:;]\s*)?(?:(?:Land\s+Cruiser(?:\s+\d{2,4})?)|"
+        r"(?:(?:Патриот|Patriot)(?:\s+(?:Профи|Profi))?)|"
+        r"(?:(?:Нива|Niva)(?:\s+(?:Travel|Тревел))?)|"
+        r"(?:\d{2,5}(?:[-/]\w{1,12})*)|"
+        r"(?:[A-ZА-ЯЁ]{1,6}\d{1,5}(?:[-/]\w{1,12})*)|"
+        r"(?:[A-Za-zА-Яа-яЁё]+))",
+        tail,
+        re.I,
+    )
+    if not model:
+        return ""
+    candidate = model.group(0).strip(" -/|,:;\t")
+    model_words = candidate.casefold().split()
+    if (candidate.casefold() in VEHICLE_MODEL_WORDS or
+            all(word in VEHICLE_MODEL_WORDS for word in model_words) or
+            re.search(r"\d", candidate) or candidate.isupper()):
+        return candidate
+    return ""
+
+
+def extract_transport_name(text: str) -> str:
+    """Достает марку/модель или тип транспорта из текста документации.
+
+    Сначала используются поля «Марка», «Модель», «Тип/вид транспортного
+    средства», затем узнаваемые сочетания вроде «ПАЗ-3205» и «КАМАЗ 65115».
+    Если документация содержит только требования без марки, возвращается тип
+    (например, «автобус»), а не произвольный длинный абзац.
+    """
+    text = _normalize_document_text(text)
+    if not text:
+        return ""
+    candidates: dict[str, tuple[int, str]] = {}
+
+    # Поля технического задания и таблиц характеристик имеют наибольший вес.
+    for match in VEHICLE_FIELD_RE.finditer(text):
+        value = _trim_vehicle_candidate(match.group(1))
+        pair = re.match(
+            r"^\s*(.+?)\s+(?:модель|модели)\s*[:=\-–—]\s*(.+?)\s*$",
+            value, re.I,
+        )
+        if pair:
+            value = _trim_vehicle_candidate(f"{pair.group(1)} {pair.group(2)}")
+        _add_vehicle_candidate(candidates, value, 120 if _has_specific_vehicle(value) else 70)
+
+    # Коды моделей: ПАЗ-3205, КАМАЗ 65115, ГАЗ 3309 и т.п. Сначала
+    # отбрасываем стандарты/годы/размеры, которые имеют такую же форму.
+    for match in VEHICLE_CODE_RE.finditer(text):
+        if _contains_non_vehicle_code(match.group(0)):
+            continue
+        start = max(0, match.start() - 90)
+        end = min(len(text), match.end() + 90)
+        context = text[start:end]
+        if VEHICLE_CONTEXT_RE.search(context) or VEHICLE_BRAND_RE.search(context):
+            brand = VEHICLE_BRAND_RE.search(context)
+            value = match.group(0)
+            if brand and brand.end() <= match.start() + 12 and brand.start() >= match.start() - 18:
+                if not value.casefold().startswith(brand.group(0).casefold()):
+                    value = f"{brand.group(0)} {value}".replace("- ", "-")
+            before = text[max(0, match.start() - 100):match.start()]
+            generic_before = list(GENERIC_VEHICLE_RE.finditer(before))
+            if generic_before:
+                generic = generic_before[-1]
+                if len(before) - generic.end() <= 35:
+                    value = f"{generic.group(0)} {value}"
+            _add_vehicle_candidate(candidates, value, 110)
+
+    # Иностранные модели и марки без цифрового индекса: Ford Transit,
+    # Mercedes-Benz Sprinter, УАЗ Patriot и т.д.
+    for match in VEHICLE_BRAND_RE.finditer(text):
+        value = match.group(0)
+        model = _vehicle_model_after_brand(text, match.end())
+        if model:
+            value = f"{value} {model}"
+            _add_vehicle_candidate(candidates, value, 115)
+        elif VEHICLE_CONTEXT_RE.search(text[max(0, match.start() - 80):match.end() + 80]):
+            _add_vehicle_candidate(candidates, value, 65)
+
+    strong = [item for item in candidates.values() if item[0] >= 90]
+    # Тип техники из названия полезен даже тогда, когда в другом месте файла
+    # уже нашлась марка/модель: закупка может одновременно включать КАМАЗ и
+    # фронтальный погрузчик. Слабые одиночные бренды при этом не добавляем.
+    for line in re.split(r"\n+|(?<=[.!?])\s+", text):
+        if not VEHICLE_CONTEXT_RE.search(line):
+            continue
+        for match in GENERIC_VEHICLE_RE.finditer(line):
+            _add_vehicle_candidate(candidates, match.group(0), 45)
+    if strong:
+        specific = strong + [
+            item for item in candidates.values()
+            if item[0] < 90 and GENERIC_VEHICLE_RE.search(item[1])
+        ]
+    else:
+        # Когда марка/модель не указана, сохраняем наиболее содержательный тип.
+        specific = list(candidates.values())
+
+    specific.sort(key=lambda item: (-item[0], -len(item[1]), item[1].casefold()))
+    selected: list[str] = []
+    for _, value in specific:
+        normalized = value.casefold()
+        if any(normalized in previous.casefold() or previous.casefold() in normalized for previous in selected):
+            continue
+        selected.append(value)
+        if len(selected) >= 6:
+            break
+    return "; ".join(selected)
+
+
+def _merge_transport_values(*values: str) -> str:
+    result: list[str] = []
+    for value in values:
+        for part in (value or "").split(";"):
+            part = _trim_vehicle_candidate(part)
+            if not part or any(_vehicle_key(part) == _vehicle_key(old) for old in result):
+                continue
+            result.append(part)
+    return "; ".join(result[:6])
+
+
+def _scan_transport_documents(
+    page: bytes | str,
+    base_url: str,
+    document_loader: Callable[[str], bytes] | None,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[str, str]:
+    if document_loader is None:
+        return "", ""
+    found: list[str] = []
+    source_urls: list[str] = []
+    links = find_document_links(page, base_url)
+    for index, document in enumerate(links, 1):
+        try:
+            if progress:
+                progress(f"Документация: чтение файла {index}/{len(links)}")
+            data = document_loader(document.url)
+            text = extract_document_text(data, document.url)
+            transport = extract_transport_name(text)
+            if transport:
+                found.append(transport)
+                # Сохраняем только ссылки на документы, в которых реально
+                # найден транспорт, чтобы колонка была полезной для проверки.
+                source_urls.append(document.url)
+        except Exception as exc:
+            if progress:
+                progress(f"Предупреждение: не удалось прочитать документацию {document.url}: {exc}")
+    return _merge_transport_values(*found), (source_urls[0] if source_urls else "")
+
+
+def enrich_from_detail(
+    t: Tender,
+    page: bytes,
+    document_loader: Callable[[str], bytes] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> Tender:
+    soup = BeautifulSoup(page, "html.parser")
+    deadline = nearby_value(soup, ["Дата и время окончания срока подачи заявок", "Дата окончания подачи заявок", "Окончание подачи заявок"])
+    if deadline:
+        t.deadline = normalize_date(deadline)
+    region = nearby_value(soup, ["Регион", "Место нахождения заказчика", "Место нахождения"])
+    if region and len(region) < 250:
+        t.region = region
+    etp = nearby_value(soup, ["Наименование электронной площадки", "Электронная площадка"])
+    if etp and len(etp) < 250:
+        t.etp = etp
+    # Ссылка рядом с блоком электронной площадки или известный домен ЭТП.
+    etp_domains = ("rts-tender.ru", "sberbank-ast.ru", "roseltorg.ru", "tektorg.ru", "fabrikant.ru", "etp-ets.ru", "lot-online.ru", "gz.lot-online.ru", "zakazrf.ru", "etpgpb.ru", "astgoz.ru")
+    for a in soup.find_all("a", href=True):
+        href = urljoin(EIS, a["href"])
+        txt = clean_text(a.get_text(" ", strip=True)).lower()
+        if any(d in href.lower() for d in etp_domains) or "электронн" in txt and "площад" in txt:
+            t.etp_url = href
+            if not t.etp:
+                t.etp = clean_text(a.get_text(" ", strip=True))
+            break
+    page_text = _normalize_document_text(soup.get_text("\n", strip=True))
+    page_transport = extract_transport_name(page_text)
+    if page_transport:
+        t.transport = _merge_transport_values(t.transport, page_transport)
+    if document_loader:
+        document_transport, source_url = _scan_transport_documents(
+            page, t.eis_url or EIS, document_loader, progress
+        )
+        if document_transport:
+            # Точное значение из ТЗ/спецификации важнее общего слова «автобус»
+            # на странице карточки.
+            t.transport = _merge_transport_values(document_transport, t.transport)
+            t.documentation_url = source_url
+    found_okpd = sorted(set(re.findall(r"(?<!\d)(?:49\.41\.(?:14|15|18|20)\.000|49\.39\.(?:31|33|34|39)\.000)(?!\d)", page_text)))
+    if found_okpd:
+        t.okpd2 = "; ".join(f"{c} — {OKPD2_CODES.get(c, '')}".rstrip(" —") for c in found_okpd)
+        t.supplier_category = SUPPLIER_CATEGORY
+    return t
+
+
+class Downloader:
+    def __init__(self, timeout: int = 45, use_powershell: bool = True, insecure: bool = False):
+        self.timeout = timeout
+        self.use_powershell = use_powershell and os.name == "nt"
+        self.insecure = insecure
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        })
+
+    def get(self, url: str) -> bytes:
+        errors = []
+        for attempt in range(3):
+            try:
+                r = self.session.get(url, timeout=self.timeout, verify=not self.insecure)
+                r.raise_for_status()
+                if not r.content:
+                    raise IOError("ЕИС вернула пустой ответ")
+                return r.content
+            except Exception as exc:
+                errors.append(str(exc))
+                time.sleep(1.5 * (2 ** attempt))
+        if self.use_powershell:
+            try:
+                return self._powershell_get(url)
+            except Exception as exc:
+                errors.append("PowerShell: " + str(exc))
+        raise IOError("Не удалось получить данные ЕИС. " + " | ".join(errors[-2:]))
+
+    def get_document(self, url: str, referer: str = "") -> bytes:
+        """Скачивает один файл документации с ограничением размера."""
+        headers = {"Referer": referer} if referer else {}
+        errors = []
+        for attempt in range(2):
+            response = None
+            try:
+                response = self.session.get(
+                    url, timeout=self.timeout, verify=not self.insecure,
+                    headers=headers, stream=True,
+                )
+                response.raise_for_status()
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > MAX_DOCUMENT_SIZE:
+                    raise IOError("файл документации больше 20 МБ")
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_DOCUMENT_SIZE:
+                        raise IOError("файл документации больше 20 МБ")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                if not data:
+                    raise IOError("получен пустой файл документации")
+                return data
+            except Exception as exc:
+                errors.append(str(exc))
+                time.sleep(1.0 * (attempt + 1))
+            finally:
+                if response is not None:
+                    response.close()
+        if self.use_powershell:
+            try:
+                data = self._powershell_get(url)
+                if len(data) <= MAX_DOCUMENT_SIZE:
+                    return data
+                errors.append("файл документации больше 20 МБ")
+            except Exception as exc:
+                errors.append("PowerShell: " + str(exc))
+        raise IOError("Не удалось скачать документацию: " + " | ".join(errors[-2:]))
+
+    def _powershell_get(self, url: str) -> bytes:
+        # На Windows mkstemp оставляет открытый дескриптор и PowerShell получает
+        # WinError 32. Закрываем его и удаляем пустой файл до Invoke-WebRequest.
+        fd, tmp_name = tempfile.mkstemp(suffix=".download")
+        os.close(fd)
+        tmp = Path(tmp_name)
+        tmp.unlink(missing_ok=True)
+        try:
+            safe_url = url.replace("'", "''")
+            safe_out = str(tmp).replace("'", "''")
+            script = (
+                "$ProgressPreference='SilentlyContinue'; "
+                f"Invoke-WebRequest -UseBasicParsing -Uri '{safe_url}' -OutFile '{safe_out}' -TimeoutSec {self.timeout}"
+            )
+            p = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                               capture_output=True, timeout=self.timeout + 15)
+            if p.returncode != 0:
+                raise IOError(p.stderr.decode("cp866", errors="replace")[-800:])
+            data = tmp.read_bytes()
+            if not data:
+                raise IOError("получен пустой файл")
+            return data
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+class TekTorgBrowser:
+    """Загрузка страниц ТЭК-Торг через Яндекс Браузер (резервно — Edge).
+
+    Площадка применяет антибот-защиту, поэтому обычный HTTP используется первым,
+    а при блокировке запускается видимое окно браузера. Пользователь может один раз
+    пройти проверку; профиль сохраняется в LOCALAPPDATA.
+    """
+    def __init__(self, progress: Callable[[str], None]):
+        self.progress = progress
+        self._pw = None
+        self._browser = None
+        self._browser_process = None
+        self._context = None
+        self._page = None
+        self.http = requests.Session()
+        self.http.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        })
+
+    @staticmethod
+    def _blocked(content: bytes | str) -> bool:
+        text = content.decode("utf-8", errors="ignore") if isinstance(content, bytes) else content
+        low = text.lower()
+        return ("сеанс работы на этп был прерван" in low or "защиты от ботов" in low or
+                "captcha_env" in low or len(text) < 1000)
+
+    @staticmethod
+    def _has_procedure_links(content: bytes | str) -> bool:
+        text = content.decode("utf-8", errors="ignore") if isinstance(content, bytes) else content
+        return bool(re.search(r'href=["\'][^"\']*/procedures/\d+', text, re.I))
+
+    @staticmethod
+    def _is_listing(url: str) -> bool:
+        return bool(re.search(r"/procedures(?:\?|$)", url))
+
+    def get(self, url: str) -> bytes:
+        # Обычный HTTP принимаем только если в выдаче действительно есть карточки.
+        # ТЭК-Торг иногда возвращает защитную/пустую оболочку с кодом 200.
+        if self._page is None:
+            try:
+                r = self.http.get(url, timeout=45)
+                valid_listing = self._has_procedure_links(r.content)
+                if r.ok and not self._blocked(r.content) and (not self._is_listing(url) or valid_listing):
+                    return r.content
+            except Exception:
+                pass
+            self._start_edge()
+        self.progress("ТЭК-Торг: загрузка через управляемый браузер…")
+        self._page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+        # Ждем отрисовки карточек Next.js. При защите пользователь проходит ее вручную.
+        last_content = ""
+        last_signature = ""
+        stable_seen = 0
+        for _ in range(45):
+            self._page.wait_for_timeout(1000)
+            last_content = self._page.content()
+            page_text = clean_text(self._page.locator("body").inner_text(timeout=5000))
+            if self._blocked(last_content):
+                self.progress("ТЭК-Торг просит проверку. Пройдите ее в открытом браузере…")
+                stable_seen = 0
+                continue
+            if not self._is_listing(url) or self._has_procedure_links(last_content):
+                return last_content.encode("utf-8")
+            # Некоторые корректные запросы по ОКПД2/ОКВЭД2 возвращают пустую
+            # выдачу без текста «0 закупок». Если страница не меняется 8 секунд,
+            # считаем это нормальным отсутствием результатов, а не аварией.
+            signature = str(hash(page_text))
+            if signature == last_signature and len(page_text) > 100:
+                stable_seen += 1
+            else:
+                last_signature = signature
+                stable_seen = 0
+            if stable_seen >= 7:
+                self.progress("ТЭК-Торг: стабильная пустая выдача, результатов по запросу нет")
+                return last_content.encode("utf-8")
+            self.progress("ТЭК-Торг: ожидается загрузка карточек процедур…")
+        # Сохраняем диагностику, чтобы можно было проверить изменение верстки.
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        debug = Path(base) / "TransportTenderParser" / "debug_tektorg.html"
+        debug.parent.mkdir(parents=True, exist_ok=True)
+        debug.write_text(last_content, encoding="utf-8", errors="ignore")
+        raise IOError(f"ТЭК-Торг открыл страницу без карточек процедур. Диагностика: {debug}")
+
+    def get_document(self, url: str, referer: str = "") -> bytes:
+        """Получает файл ТЭК-Торг обычной сессией, затем через браузер при необходимости."""
+        headers = {"Referer": referer} if referer else {}
+        response = None
+        try:
+            response = self.http.get(url, timeout=45, headers=headers, stream=True)
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_DOCUMENT_SIZE:
+                raise IOError("файл документации больше 20 МБ")
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOCUMENT_SIZE:
+                    raise IOError("файл документации больше 20 МБ")
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            low = data[:20000].decode("utf-8", errors="ignore").lower()
+            if data and not any(marker in low for marker in ("защиты от ботов", "captcha_env", "сеанс работы на этп был прерван")):
+                return data
+        except Exception:
+            pass
+        finally:
+            if response is not None:
+                response.close()
+        if self._page is not None:
+            try:
+                response = self._page.request.get(url, headers=headers, timeout=45_000)
+                data = response.body()
+                if len(data) <= MAX_DOCUMENT_SIZE and data:
+                    return data
+            except Exception as exc:
+                raise IOError("не удалось получить файл через браузер: " + str(exc)) from exc
+        raise IOError("не удалось получить файл документации")
+
+    @staticmethod
+    def _find_yandex_browser() -> str | None:
+        candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Yandex/YandexBrowser/Application/browser.exe",
+            Path(os.environ.get("PROGRAMFILES", "")) / "Yandex/YandexBrowser/Application/browser.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Yandex/YandexBrowser/Application/browser.exe",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return str(path)
+        return None
+
+    @staticmethod
+    def _free_local_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def _start_edge(self):
+        """Яндекс запускается самостоятельно и подключается по CDP.
+
+        launch_persistent_context несовместим с некоторыми сборками Яндекс
+        Браузера и приводил к TargetClosedError. CDP использует штатный запуск
+        браузера и не зависит от версии встроенного Chromium.
+        """
+        try:
+            self._pw = sync_playwright().start()
+        except Exception as exc:
+            raise IOError(
+                "Не удалось запустить Playwright (драйвер управления браузером). "
+                "Переустановите библиотеки: удалите папку .venv и запустите run.bat. " + str(exc)
+            ) from exc
+        base = _app_data_dir()
+        yandex = self._find_yandex_browser()
+        if yandex:
+            self.progress("Запускается Яндекс Браузер через безопасное CDP-подключение…")
+            try:
+                self._connect_over_cdp(yandex, base / "yandex_cdp_profile", "Яндекс Браузер")
+                return
+            except Exception as exc:
+                self.progress(f"ПРЕДУПРЕЖДЕНИЕ: Яндекс Браузер недоступен ({exc}). Пробую Microsoft Edge…")
+
+        # Резервный вариант: Microsoft Edge (есть в каждой Windows 10/11),
+        # затем Google Chrome. Запускаются тем же способом — по CDP, чтобы
+        # не зависеть от версии встроенного Chromium.
+        for label, path, profile_name in (
+            ("Microsoft Edge", self._find_chromium_browser("edge"), "edge_cdp_profile"),
+            ("Google Chrome", self._find_chromium_browser("chrome"), "chrome_cdp_profile"),
+        ):
+            if not path:
+                continue
+            self.progress(f"Запускается {label}…")
+            try:
+                self._connect_over_cdp(path, base / profile_name, label)
+                return
+            except Exception as exc:
+                self.progress(f"ПРЕДУПРЕЖДЕНИЕ: {label} недоступен ({exc}).")
+
+        # Последняя попытка — Edge как канал Playwright (если путь нестандартный).
+        self.progress("Запускается Microsoft Edge через Playwright…")
+        profile = base / "edge_profile"
+        profile.mkdir(parents=True, exist_ok=True)
+        try:
+            self._context = self._pw.chromium.launch_persistent_context(
+                str(profile), channel="msedge", headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                viewport={"width": 1280, "height": 900}, locale="ru-RU",
+            )
+        except Exception as exc:
+            self._pw.stop()
+            self._pw = None
+            raise IOError(
+                "Не найден ни Яндекс Браузер, ни Microsoft Edge, ни Google Chrome. "
+                "Установите один из них, чтобы проходить проверку ТЭК-Торг. " + str(exc)
+            )
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+
+    @staticmethod
+    def _find_chromium_browser(kind: str) -> str | None:
+        """Ищет исполняемый файл Edge или Chrome в стандартных папках Windows."""
+        roots = [os.environ.get(k, "") for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+        relative = {
+            "edge": ["Microsoft/Edge/Application/msedge.exe"],
+            "chrome": ["Google/Chrome/Application/chrome.exe"],
+        }[kind]
+        for root in roots:
+            if not root:
+                continue
+            for rel in relative:
+                candidate = Path(root) / rel
+                if candidate.is_file():
+                    return str(candidate)
+        return None
+
+    def _connect_over_cdp(self, executable: str, profile: Path, label: str) -> None:
+        """Запускает браузер с отладочным портом и подключается к нему по CDP.
+
+        Браузер стартует как обычное приложение пользователя (видимое окно,
+        свой профиль в LOCALAPPDATA), поэтому антибот-защита видит настоящий
+        браузер, а пройденная один раз проверка сохраняется между запусками.
+        """
+        profile.mkdir(parents=True, exist_ok=True)
+        port = self._free_local_port()
+        cmd = [
+            executable, f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
+            "--new-window", "about:blank",
+        ]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            self._browser_process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            endpoint = f"http://127.0.0.1:{port}"
+            ready = False
+            for _ in range(40):
+                if self._browser_process.poll() is not None:
+                    raise IOError(f"{label} завершился сразу после запуска")
+                try:
+                    if requests.get(endpoint + "/json/version", timeout=1).ok:
+                        ready = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            if not ready:
+                raise IOError(f"{label} не открыл порт удаленного управления")
+            self._browser = self._pw.chromium.connect_over_cdp(endpoint, timeout=30_000)
+            self._context = self._browser.contexts[0] if self._browser.contexts else None
+            if self._context is None:
+                raise IOError(f"Не получен контекст {label}")
+            self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+        except Exception:
+            if self._browser_process and self._browser_process.poll() is None:
+                try:
+                    self._browser_process.terminate()
+                except Exception:
+                    pass
+            self._browser_process = None
+            self._browser = self._context = self._page = None
+            raise
+
+    def close(self):
+        try:
+            if self._browser:
+                try:
+                    self._browser.close()
+                except Exception:
+                    pass
+            elif self._context:
+                try:
+                    self._context.close()
+                except Exception:
+                    pass
+        finally:
+            if self._browser_process and self._browser_process.poll() is None:
+                try:
+                    self._browser_process.terminate()
+                    self._browser_process.wait(timeout=5)
+                except Exception:
+                    try:
+                        self._browser_process.kill()
+                    except Exception:
+                        pass
+            if self._pw:
+                try:
+                    self._pw.stop()
+                except Exception:
+                    pass
+            self._browser = self._browser_process = None
+            self._context = self._page = self._pw = None
+
+
+def _card_container(anchor):
+    node = anchor
+    for _ in range(10):
+        node = node.parent
+        if not node:
+            break
+        txt = clean_text(node.get_text(" ", strip=True))
+        if "Организатор" in txt and "Дата публикации" in txt and 80 < len(txt) < 7000:
+            return node
+    return anchor.parent
+
+
+def _tektorg_date(text: str, label_patterns: list[str]) -> str:
+    for label in label_patterns:
+        m = re.search(re.escape(label) + r"\s*(\d{2}\.\d{2}\.\d{4})\s*(\d{1,2}:\d{2})?", text, re.I)
+        if m:
+            return m.group(1) + ((" " + m.group(2)) if m.group(2) else "")
+    return ""
+
+
+def parse_tektorg_listing(page: bytes, section_key: str, keyword: str) -> list[Tender]:
+    soup = BeautifulSoup(page, "html.parser")
+    rows: list[Tender] = []
+    seen = set()
+    href_re = re.compile(r"/(?:market|rosneft|rosnefttkp|org/[^/]+)/procedures/(\d+)(?:[/?#]|$)", re.I)
+    section_names = {
+        "market": "ТЭК-Торг — КИМ (Интернет-магазин)",
+        "rosneft": "ТЭК-Торг — Роснефть: закупочные процедуры",
+        "rosnefttkp": "ТЭК-Торг — Роснефть: запросы (Т)КП",
+    }
+    for a in soup.find_all("a", href=True):
+        href = urljoin("https://www.tektorg.ru", a.get("href", ""))
+        mlink = href_re.search(href)
+        title = clean_text(a.get_text(" ", strip=True))
+        if not mlink or not title or mlink.group(1) in seen:
+            continue
+        seen.add(mlink.group(1))
+        card = _card_container(a)
+        text = clean_text(card.get_text(" ", strip=True))
+        num = ""
+        m = re.search(r"№\s*([A-ZА-ЯЁ0-9][A-ZА-ЯЁ0-9\-]{2,30})", text, re.I)
+        if m:
+            num = m.group(1)
+        if not num:
+            num = mlink.group(1)
+        customer = ""
+        m = re.search(r"Организатор\s*(.*?)\s*Начальная цена", text, re.I | re.S)
+        if m:
+            customer = clean_text(m.group(1))
+        price_text = ""
+        m = re.search(r"Начальная цена\s*(.*?)\s*Дата публикации", text, re.I | re.S)
+        if m:
+            price_text = clean_text(m.group(1))
+        status = ""
+        for candidate in ["Приём заявок", "Прием заявок", "Работа комиссии", "Архив", "Отменён", "Отменен"]:
+            if candidate.lower() in text.lower():
+                status = candidate
+                break
+        published = _tektorg_date(text, ["Дата публикации"])
+        deadline = _tektorg_date(text, ["Дата окончания срока подачи технико-коммерческих частей", "Дата окончания приема заявок", "Дата окончания приёма заявок"])
+        rows.append(Tender(
+            number=num, title=title, transport=extract_transport_name(title), nmck=parse_price(price_text),
+            published=published, deadline=deadline, customer=customer, law="Коммерческая закупка",
+            status=status, procedure="", etp=section_names.get(section_key, "ТЭК-Торг"),
+            etp_url=href, eis_url="", matched_keyword=keyword,
+        ))
+    return rows
+
+
+def enrich_tektorg_detail(
+    t: Tender,
+    page: bytes,
+    document_loader: Callable[[str], bytes] | None = None,
+    progress: Callable[[str], None] | None = None,
+):
+    soup = BeautifulSoup(page, "html.parser")
+    if not t.deadline:
+        t.deadline = normalize_date(nearby_value(soup, [
+            "Дата окончания срока подачи технико-коммерческих частей",
+            "Дата окончания приема заявок", "Дата окончания приёма заявок"
+        ]))
+    region = nearby_value(soup, ["Регион организатора", "Регион поставки", "Регион"])
+    if region and len(region) < 250:
+        t.region = region
+    procedure = nearby_value(soup, ["Способ закупки", "Способ определения поставщика", "Тип процедуры"])
+    if procedure and len(procedure) < 250:
+        t.procedure = procedure
+    page_text = _normalize_document_text(soup.get_text("\n", strip=True))
+    page_transport = extract_transport_name(page_text)
+    if page_transport:
+        t.transport = _merge_transport_values(t.transport, page_transport)
+    if document_loader:
+        document_transport, source_url = _scan_transport_documents(
+            page, t.etp_url, document_loader, progress
+        )
+        if document_transport:
+            t.transport = _merge_transport_values(document_transport, t.transport)
+            t.documentation_url = source_url
+    found_okved = sorted(set(re.findall(r"(?<!\d)(?:49\.41\.[123]|49\.42|49\.31\.21|49\.39\.(?:31|33|34))(?!\d)", page_text)))
+    found_okpd = sorted(set(re.findall(r"(?<!\d)(?:49\.41\.(?:14|15|18|20)\.000|49\.39\.(?:31|33|34|39)\.000)(?!\d)", page_text)))
+    if found_okved:
+        t.okved2 = "; ".join(f"{c} — {OKVED2_CODES.get(c, '')}".rstrip(" —") for c in found_okved)
+    if found_okpd:
+        t.okpd2 = "; ".join(f"{c} — {OKPD2_CODES.get(c, '')}".rstrip(" —") for c in found_okpd)
+    if t.okved2 or t.okpd2:
+        t.supplier_category = SUPPLIER_CATEGORY
+    return t
+
+
+def collect_tektorg(date_from: str, date_to: str, region_name: str, customer_filter: str,
+                     keywords: list[str], active_only: bool, sections: list[str],
+                     progress: Callable[[str], None], stop_event: threading.Event,
+                     okved_codes: list[str], okpd_codes: list[str]) -> list[Tender]:
+    browser = TekTorgBrowser(progress)
+    unique: dict[str, Tender] = {}
+    d1, d2 = parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)
+    bases = {
+        "market": "https://www.tektorg.ru/market/procedures",
+        "rosneft": "https://www.tektorg.ru/rosneft/procedures",
+        "rosnefttkp": "https://www.tektorg.ru/rosnefttkp/procedures",
+    }
+    try:
+        # Три независимых канала поиска: слова, ОКВЭД2 и ОКПД2.
+        searches = [("name", kw, f"Ключевые слова: {kw}") for kw in keywords]
+        searches += [("okved2", code, f"ОКВЭД2 {code} — {OKVED2_CODES.get(code, '')}".rstrip(" —")) for code in okved_codes]
+        searches += [("okpd2", code, f"ОКПД2 {code} — {OKPD2_CODES.get(code, '')}".rstrip(" —")) for code in okpd_codes]
+        for section in sections:
+            for si, (param_name, search_value, search_label) in enumerate(searches, 1):
+                if stop_event.is_set():
+                    break
+                progress(f"ТЭК-Торг {section}, запрос {si}/{len(searches)}: {search_label}")
+                page_signatures = set()
+                max_pages = 5 if param_name == "name" else 3
+                for page_no in range(1, max_pages + 1):
+                    if stop_event.is_set():
+                        break
+                    params = {param_name: search_value, "page": page_no}
+                    url = bases[section] + "?" + urlencode(params)
+                    try:
+                        content = browser.get(url)
+                        found = parse_tektorg_listing(content, section, search_label)
+                    except Exception as exc:
+                        # Ошибка одного кода не должна обнулять уже собранные закупки.
+                        progress(f"ПРЕДУПРЕЖДЕНИЕ ТЭК-Торг {section}, «{search_label}»: {exc}")
+                        break
+                    if not found:
+                        progress(f"ТЭК-Торг {section}: по запросу «{search_label}» карточки не получены")
+                        break
+                    signature = tuple(t.etp_url for t in found)
+                    if signature in page_signatures:
+                        progress(f"ТЭК-Торг {section}: страница повторилась, переход к следующему запросу")
+                        break
+                    page_signatures.add(signature)
+                    for t in found:
+                        if param_name == "okved2":
+                            t.okved2 = f"{search_value} — {OKVED2_CODES.get(search_value, '')}".rstrip(" —")
+                            t.supplier_category = SUPPLIER_CATEGORY
+                        elif param_name == "okpd2":
+                            t.okpd2 = f"{search_value} — {OKPD2_CODES.get(search_value, '')}".rstrip(" —")
+                            t.supplier_category = SUPPLIER_CATEGORY
+                        pub = parse_ddmmyyyy(t.published)
+                        if pub and ((d1 and pub < d1) or (d2 and pub > d2)):
+                            continue
+                        if not matches_road_transport(t):
+                            # При поиске по профильному коду доверяем классификатору,
+                            # даже если краткое название не содержит слова «перевозка».
+                            if param_name not in ("okved2", "okpd2"):
+                                continue
+                        if active_only and t.status and "заяв" not in t.status.lower():
+                            continue
+                        if customer_filter and customer_filter.lower() not in t.customer.lower():
+                            continue
+                        key = "tektorg:" + section + ":" + t.number
+                        existing = unique.get(key)
+                        if existing:
+                            for attr in ("okved2", "okpd2", "matched_keyword"):
+                                value = getattr(t, attr)
+                                current = getattr(existing, attr)
+                                if value and value not in current:
+                                    setattr(existing, attr, "; ".join(x for x in (current, value) if x))
+                            if t.supplier_category:
+                                existing.supplier_category = t.supplier_category
+                        else:
+                            unique[key] = t
+                    progress(f"ТЭК-Торг {section}: страница {page_no}, всего подходящих {len(unique)}")
+                    time.sleep(0.4)
+        # Детализация только уже отобранных карточек.
+        items = list(unique.values())
+        for i, t in enumerate(items, 1):
+            if stop_event.is_set():
+                break
+            progress(f"ТЭК-Торг: уточнение региона {i}/{len(items)} — № {t.number}")
+            try:
+                enrich_tektorg_detail(
+                    t,
+                    browser.get(t.etp_url),
+                    document_loader=lambda url, referer=t.etp_url: browser.get_document(url, referer),
+                    progress=progress,
+                )
+            except Exception as exc:
+                progress(f"Предупреждение ТЭК-Торг № {t.number}: {exc}")
+            time.sleep(0.25)
+        # Регион проверяется после детализации. Если площадка не указала регион — запись сохраняется.
+        if region_name != "Все регионы":
+            target = region_name.lower().replace(" — ", " ")
+            items = [t for t in items if not t.region or target.split()[0] in t.region.lower()]
+        return items
+    finally:
+        browser.close()
+
+
+def build_rss_url(keyword: str, date_from: str, date_to: str, region_code: str, page: int, active_only: bool) -> str:
+    params = {
+        "searchString": keyword, "morphology": "on", "search-filter": "Дате размещения",
+        "pageNumber": page, "sortDirection": "false", "recordsPerPage": "_200",
+        "showLotsInfoHidden": "false", "sortBy": "PUBLISH_DATE", "fz44": "on", "fz223": "on",
+        "publishDateFrom": date_from, "publishDateTo": date_to,
+    }
+    if region_code:
+        params["regions"] = region_code
+    if active_only:
+        params["af"] = "on"  # этап «Подача заявок» в форме ЕИС
+    return RSS_URL + "?" + urlencode(params)
+
+
+def matches_road_transport(t: Tender) -> bool:
+    text = f"{t.title} {t.procedure}".lower()
+    if TRANSPORT_PRODUCT_RE.search(text) and "услуг" not in text:
+        return False
+    if EXCLUDE_RE.search(text):
+        return False
+    # Одни названия модели/типа могут не содержать слова «автомобиль»:
+    # например, «УАЗ Патриот», «ПАЗ-3205», «трал» или «полуприцеп».
+    return bool(ROAD_RE.search(text)) or bool(extract_transport_name(text))
+
+
+def parse_ddmmyyyy(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s[:10], "%d.%m.%Y")
+    except Exception:
+        return None
+
+
+def parse_code_list(value: str) -> list[str]:
+    result = []
+    for code in re.split(r"[,;\s]+", value.strip()):
+        code = code.strip()
+        if code and code not in result:
+            result.append(code)
+    return result
+
+
+def collect_eis(date_from: str, date_to: str, region_name: str, customer_filter: str,
+                keywords: list[str], active_only: bool, enrich: bool,
+                progress: Callable[[str], None], stop_event: threading.Event,
+                insecure: bool = False, okpd_codes: list[str] | None = None) -> list[Tender]:
+    dl = Downloader(insecure=insecure)
+    region_code = REGIONS.get(region_name, "")
+    unique: dict[str, Tender] = {}
+    okpd_codes = okpd_codes or []
+    search_terms = keywords + okpd_codes
+    for ki, keyword in enumerate(search_terms, 1):
+        if stop_event.is_set():
+            break
+        progress(f"ЕИС, запрос {ki}/{len(search_terms)}: {keyword}")
+        for page in range(1, 6):
+            if stop_event.is_set():
+                break
+            url = build_rss_url(keyword, date_from, date_to, region_code, page, active_only)
+            rows = parse_rss(dl.get(url), keyword)
+            if not rows:
+                break
+            added = 0
+            for t in rows:
+                if not t.number:
+                    continue
+                is_code_search = keyword in okpd_codes
+                if not matches_road_transport(t) and not is_code_search:
+                    continue
+                if is_code_search:
+                    t.okpd2 = f"{keyword} — {OKPD2_CODES.get(keyword, '')}".rstrip(" —")
+                    t.supplier_category = SUPPLIER_CATEGORY
+                if active_only and t.status and "подача заявок" not in t.status.lower():
+                    continue
+                if customer_filter and customer_filter.lower() not in t.customer.lower():
+                    continue
+                if t.number not in unique:
+                    t.region = region_name if region_code else ""
+                    unique[t.number] = t
+                    added += 1
+                elif t.okpd2 and t.okpd2 not in unique[t.number].okpd2:
+                    current = unique[t.number]
+                    current.okpd2 = "; ".join(x for x in (current.okpd2, t.okpd2) if x)
+                    current.supplier_category = SUPPLIER_CATEGORY
+            progress(f"ЕИС, {keyword}: страница {page}, новых {added}, всего {len(unique)}")
+            if len(rows) < 190:
+                break
+            time.sleep(0.35)
+    eis_rows = list(unique.values())
+    if enrich and eis_rows:
+        for i, t in enumerate(eis_rows, 1):
+            if stop_event.is_set():
+                break
+            progress(f"ЕИС: карточка и документация {i}/{len(eis_rows)} — № {t.number}")
+            try:
+                enrich_from_detail(
+                    t,
+                    dl.get(t.eis_url),
+                    document_loader=lambda url, referer=t.eis_url: dl.get_document(url, referer),
+                    progress=progress,
+                )
+            except Exception as exc:
+                progress(f"Предупреждение ЕИС № {t.number}: {exc}")
+            time.sleep(0.3)
+    return eis_rows
+
+
+def collect_tenders(date_from: str, date_to: str, region_name: str, customer_filter: str,
+                    keywords: list[str], active_only: bool, enrich: bool,
+                    progress: Callable[[str], None], stop_event: threading.Event,
+                    insecure: bool = False, include_eis: bool = True,
+                    include_market: bool = True, include_rosneft: bool = True,
+                    include_rosnefttkp: bool = True,
+                    okved_codes: list[str] | None = None,
+                    okpd_codes: list[str] | None = None) -> list[Tender]:
+    # Поиск по классификаторам отключен по требованию пользователя.
+    okved_codes = []
+    okpd_codes = []
+    all_rows: list[Tender] = []
+    errors: list[str] = []
+    successful_sources = 0
+
+    if include_eis and not stop_event.is_set():
+        try:
+            all_rows.extend(collect_eis(
+                date_from, date_to, region_name, customer_filter, keywords,
+                active_only, enrich, progress, stop_event, insecure, okpd_codes
+            ))
+            successful_sources += 1
+        except Exception as exc:
+            msg = "ЕИС недоступна: " + str(exc)
+            errors.append(msg)
+            progress("ПРЕДУПРЕЖДЕНИЕ: " + msg)
+            progress("Программа продолжает поиск в выбранных разделах ТЭК-Торг.")
+
+    sections = []
+    if include_market:
+        sections.append("market")
+    if include_rosneft:
+        sections.append("rosneft")
+    if include_rosnefttkp:
+        sections.append("rosnefttkp")
+    if sections and not stop_event.is_set():
+        try:
+            all_rows.extend(collect_tektorg(
+                date_from, date_to, region_name, customer_filter, keywords,
+                active_only, sections, progress, stop_event, okved_codes, okpd_codes
+            ))
+            successful_sources += 1
+        except Exception as exc:
+            msg = "ТЭК-Торг недоступен: " + str(exc)
+            errors.append(msg)
+            progress("ПРЕДУПРЕЖДЕНИЕ: " + msg)
+
+    if successful_sources == 0 and errors and not stop_event.is_set():
+        raise IOError("Не удалось получить данные ни из одного источника. " + " | ".join(errors))
+
+    d1, d2 = parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)
+    filtered, seen = [], set()
+    for t in all_rows:
+        d = parse_ddmmyyyy(t.published)
+        if (d and d1 and d < d1) or (d and d2 and d > d2):
+            continue
+        key = (t.etp_url or t.eis_url or "") + "|" + t.number
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(t)
+    filtered.sort(key=lambda x: parse_ddmmyyyy(x.published) or datetime.min, reverse=True)
+    return filtered
+
+def export_xlsx(rows: list[Tender], path: str, params: dict):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Актуальные закупки"
+    headers = ["№", "Номер закупки", "Объект закупки", "Транспорт (марка/модель)",
+               "Документация транспорта", "НМЦК, руб.", "Дата публикации", "Окончание подачи",
+               "Регион", "Заказчик", "Закон", "Статус", "Способ закупки",
+               "Электронная площадка", "Ссылка на ЭТП", "Ссылка на ЕИС", "Найдено по запросу"]
+    ws.append(headers)
+    for i, t in enumerate(rows, 1):
+        ws.append([i, t.number, t.title, t.transport, t.documentation_url, t.nmck, t.published,
+                   t.deadline, t.region, t.customer, t.law, t.status, t.procedure, t.etp,
+                   t.etp_url, t.eis_url, t.matched_keyword])
+    fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in ws[1]:
+        cell.fill, cell.font, cell.alignment = fill, Font(color="FFFFFF", bold=True), Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    widths = [6, 24, 55, 34, 42, 18, 16, 20, 24, 45, 12, 20, 28, 30, 38, 38, 28]
+    for idx, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    for row in ws.iter_rows(min_row=2):
+        row[5].number_format = '#,##0.00'
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for link_col in (4, 14, 15):
+            if row[link_col].value:
+                row[link_col].hyperlink = row[link_col].value
+                row[link_col].style = "Hyperlink"
+    if len(rows) >= 1:
+        tab = Table(displayName="TenderTable", ref=f"A1:Q{len(rows)+1}")
+        tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False, showLastColumn=False)
+        ws.add_table(tab)
+    info = wb.create_sheet("Параметры выгрузки")
+    info.append(["Параметр", "Значение"])
+    info.append(["Дата и время формирования", datetime.now().strftime("%d.%m.%Y %H:%M")])
+    for k, v in params.items():
+        info.append([k, str(v)])
+    info.append(["Количество закупок", len(rows)])
+    info.append(["Примечание", "Данные получены из открытых разделов ЕИС и/или ТЭК-Торг. Перед подачей заявки проверьте актуальность в карточке закупки на площадке."])
+    info.column_dimensions["A"].width = 34
+    info.column_dimensions["B"].width = 100
+    for c in info[1]:
+        c.fill, c.font = fill, Font(color="FFFFFF", bold=True)
+    wb.save(path)
+
+
+def _classify_log_line(text: str) -> tuple[str, str]:
+    """Определяет тег форматирования строки журнала и текущий статус по её тексту.
+
+    Возвращает пару (тег_для_Text, статус_для_индикатора). Вынесено в отдельную
+    функцию модуля, чтобы логику классификации можно было проверить без GUI.
+    """
+    if text.startswith("ОШИБКА"):
+        return "error", "error"
+    if text.startswith("ПРЕДУПРЕЖДЕНИЕ"):
+        return "warning", "warning"
+    if text.startswith("Готово"):
+        return "success", "success"
+    if text.startswith("Запрошена остановка"):
+        return "warning", "stopped"
+    return "info", "running"
+
+
+class TruckProgress(tk.Canvas):
+    """Индикатор хода поиска: синий грузовик едет по дороге вместо полосы.
+
+    Интерфейс повторяет ttk.Progressbar в режиме indeterminate — методы
+    start(interval) и stop(), поэтому остальной код окна не меняется.
+    Рисуется на Canvas, чтобы не зависеть от файлов картинок и тем ttk.
+    """
+
+    HEIGHT = 44
+    TRUCK_WIDTH = 66
+    FRAME_MS = 33  # ~30 кадров в секунду
+
+    def __init__(self, master, bg: str, truck_color: str, road_color: str = "#b7bfd1",
+                 dash_color: str = "#ffffff", stripe_color: str = "#7fa5f5", **kwargs):
+        super().__init__(master, height=self.HEIGHT, bg=bg, highlightthickness=0, bd=0, **kwargs)
+        self.bg = bg
+        self.truck_color = truck_color
+        self.road_color = road_color
+        self.dash_color = dash_color
+        self.stripe_color = stripe_color
+        self._job = None
+        self._running = False
+        self._x = 0.0
+        self._phase = 0.0
+        self._speed = 4.0  # пикселей за кадр
+        self.bind("<Configure>", lambda _e: self._draw())
+        self._draw()
+
+    # --- совместимость с ttk.Progressbar -------------------------------
+    def start(self, interval: int | None = None):
+        if interval:
+            # Чем меньше интервал у полосы, тем быстрее должен ехать грузовик.
+            self._speed = max(2.0, min(7.0, 40.0 / interval))
+        if self._running:
+            return
+        self._running = True
+        self._x = -self.TRUCK_WIDTH
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+        self._draw()
+
+    # --- анимация -----------------------------------------------------
+    def _tick(self):
+        if not self._running:
+            return
+        width = max(self.winfo_width(), 1)
+        self._x += self._speed
+        self._phase += self._speed
+        if self._x > width + 10:
+            self._x = -self.TRUCK_WIDTH
+        self._draw()
+        self._job = self.after(self.FRAME_MS, self._tick)
+
+    def _draw(self):
+        self.delete("all")
+        width = max(self.winfo_width(), 1)
+        h = self.HEIGHT
+        road_y = h - 10
+        # Дорога и прерывистая разметка. В покое разметка стоит, в движении
+        # «бежит» назад — так заметно, что грузовик едет, а не стоит.
+        self.create_rectangle(0, road_y, width, h, fill=self.road_color, outline="")
+        dash_len, gap = 18, 14
+        offset = -(self._phase % (dash_len + gap)) if self._running else 0
+        x = offset
+        while x < width:
+            self.create_line(x, road_y + 5, x + dash_len, road_y + 5, fill=self.dash_color, width=2)
+            x += dash_len + gap
+        if self._running:
+            self._draw_truck(self._x, road_y)
+        else:
+            # В покое грузовик припаркован слева.
+            self._draw_truck(8, road_y)
+
+    def _draw_truck(self, x: float, ground: float):
+        c = self.truck_color
+        # Лёгкое покачивание кузова во время движения.
+        bob = math.sin(self._phase / 6.0) * 0.8 if self._running else 0.0
+        top = ground - 26 + bob
+        # Кузов (фургон) — сплошной синий с тонкой светлой полосой.
+        self.create_rectangle(x, top, x + 42, ground - 6 + bob, fill=c, outline=c)
+        self.create_rectangle(x + 4, top + 11, x + 38, top + 13, fill=self.stripe_color, outline="")
+        # Кабина с окном и скошенным капотом.
+        self.create_polygon(
+            x + 42, top + 6, x + 54, top + 6, x + 62, top + 14, x + 62, ground - 6 + bob,
+            x + 42, ground - 6 + bob, fill=c, outline=c,
+        )
+        self.create_polygon(
+            x + 45, top + 9, x + 53, top + 9, x + 59, top + 15, x + 59, top + 17, x + 45, top + 17,
+            fill="#dbe9ff", outline="",
+        )
+        # Фара и бампер.
+        self.create_rectangle(x + 60, ground - 11 + bob, x + 63, ground - 8 + bob, fill="#ffd56b", outline="")
+        self.create_rectangle(x + 40, ground - 7 + bob, x + 64, ground - 5 + bob, fill="#1f2430", outline="")
+        # Колёса (вращение показано «спицей», угол зависит от пройденного пути).
+        angle = self._phase / 4.0 if self._running else 0.0
+        for cx in (x + 12, x + 32, x + 52):
+            cy = ground - 3
+            self.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill="#1f2430", outline="")
+            self.create_oval(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, fill="#9aa3b5", outline="")
+            dx, dy = math.cos(angle) * 4.5, math.sin(angle) * 4.5
+            self.create_line(cx - dx, cy - dy, cx + dx, cy + dy, fill="#9aa3b5", width=1)
+        # Небольшие «клубы» выхлопа позади при движении.
+        if self._running:
+            for i, r in enumerate((3, 2.2, 1.6)):
+                px = x - 5 - i * 7 - (self._phase % 7)
+                py = ground - 8 - i * 2 + math.sin(self._phase / 3 + i) * 1.5
+                self.create_oval(px - r, py - r, px + r, py + r, fill="#d5dae6", outline="")
+
+
+class App(tk.Tk):
+    """Главное окно программы.
+
+    Состоит из шапки, трёх вкладок (Поиск / Результаты / Журнал) и панели
+    действий, закреплённой внизу и видимой независимо от активной вкладки —
+    поэтому кнопки «Найти»/«Остановить»/«Выгрузить в Excel» и индикатор
+    хода работы доступны всегда, даже если пользователь просматривает
+    результаты или журнал во время поиска.
+    """
+
+    # Единая цветовая палитра интерфейса. Собрана в одном месте, чтобы
+    # менять оформление, не разыскивая цвета по всему классу.
+    BG = "#f3f5fb"
+    CARD_BG = "#ffffff"
+    TEXT = "#1f2430"
+    MUTED = "#6b7280"
+    BORDER = "#e2e6f0"
+    ACCENT = "#2f6fed"
+    ACCENT_DARK = "#2657c4"
+    SUCCESS = "#1f9d55"
+    SUCCESS_DARK = "#17803f"
+    WARNING = "#e08a1e"
+    ERROR = "#d64545"
+    ROW_ALT_BG = "#eef1f9"
+
+    STATUS_COLORS = {
+        "idle": MUTED, "running": ACCENT, "success": SUCCESS,
+        "warning": WARNING, "error": ERROR, "stopped": MUTED,
+    }
+
+    RESULT_COLUMNS = ("number", "title", "transport", "nmck", "region", "customer", "deadline", "etp")
+    RESULT_HEADINGS = {
+        "number": "№ закупки", "title": "Объект закупки", "transport": "Транспорт (марка/модель)",
+        "nmck": "НМЦК, руб.", "region": "Регион", "customer": "Заказчик",
+        "deadline": "Окончание подачи", "etp": "Площадка",
+    }
+    RESULT_WIDTHS = {
+        "number": 140, "title": 340, "transport": 190, "nmck": 110,
+        "region": 150, "customer": 220, "deadline": 130, "etp": 170,
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_NAME} {APP_VERSION}")
+        self.stop_event = threading.Event()
+        self.rows: list[Tender] = []
+        self._tree_rows: dict[str, Tender] = {}
+        self._last_export_path: str | None = None
+        self._build_ui()
+        self._set_status("idle", "Готово к работе")
+        self.minsize(1000, 680)
+        self._center_window(1120, 760)
+
+    def _center_window(self, width: int, height: int):
+        self.update_idletasks()
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    # ------------------------------------------------------------------
+    # Оформление
+    # ------------------------------------------------------------------
+    def _setup_style(self):
+        """Настраивает цветовую тему ttk. Любая неподдерживаемая на конкретной
+        версии Tcl/Tk опция молча пропускается, чтобы внешний вид никогда не
+        мог помешать запуску программы."""
+        self.configure(background=self.BG)
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        def cfg(name, **kw):
+            try:
+                style.configure(name, **kw)
+            except tk.TclError:
+                pass
+
+        def mp(name, **kw):
+            try:
+                style.map(name, **kw)
+            except tk.TclError:
+                pass
+
+        base_font = ("Segoe UI", 10)
+        cfg(".", background=self.BG, foreground=self.TEXT, font=base_font)
+        cfg("TFrame", background=self.BG)
+        cfg("Card.TFrame", background=self.CARD_BG)
+        cfg("TLabel", background=self.BG, foreground=self.TEXT)
+        cfg("Card.TLabel", background=self.CARD_BG, foreground=self.TEXT)
+        cfg("Header.TLabel", background=self.BG, foreground=self.TEXT, font=("Segoe UI", 17, "bold"))
+        cfg("Sub.TLabel", background=self.BG, foreground=self.MUTED, font=("Segoe UI", 10))
+        cfg("Muted.TLabel", background=self.BG, foreground=self.MUTED, font=("Segoe UI", 9))
+        cfg("CardMuted.TLabel", background=self.CARD_BG, foreground=self.MUTED, font=("Segoe UI", 9))
+
+        cfg("TLabelframe", background=self.CARD_BG, bordercolor=self.BORDER, relief="solid", borderwidth=1)
+        cfg("TLabelframe.Label", background=self.CARD_BG, foreground=self.TEXT, font=("Segoe UI", 10, "bold"))
+        cfg("Card.TLabelframe", background=self.CARD_BG, bordercolor=self.BORDER, relief="solid", borderwidth=1)
+        cfg("Card.TLabelframe.Label", background=self.CARD_BG, foreground=self.TEXT, font=("Segoe UI", 10, "bold"))
+
+        cfg("TEntry", fieldbackground="#ffffff", foreground=self.TEXT, bordercolor=self.BORDER,
+            lightcolor=self.BORDER, darkcolor=self.BORDER, padding=6)
+        mp("TEntry", bordercolor=[("focus", self.ACCENT)], lightcolor=[("focus", self.ACCENT)],
+           darkcolor=[("focus", self.ACCENT)])
+
+        cfg("TCombobox", fieldbackground="#ffffff", foreground=self.TEXT, padding=5, arrowsize=13)
+        mp("TCombobox", fieldbackground=[("readonly", "#ffffff")])
+
+        cfg("TCheckbutton", background=self.CARD_BG, foreground=self.TEXT, font=("Segoe UI", 9), padding=(2, 3))
+        mp("TCheckbutton", background=[("active", self.CARD_BG)],
+           indicatorcolor=[("selected", self.ACCENT), ("!selected", "#ffffff")])
+
+        cfg("TButton", background="#e7ebf5", foreground=self.TEXT, borderwidth=0, padding=(14, 8), font=base_font)
+        mp("TButton", background=[("active", "#dbe2f2"), ("disabled", "#eef1f7")],
+           foreground=[("disabled", "#a7adba")])
+
+        cfg("Accent.TButton", background=self.ACCENT, foreground="#ffffff", padding=(16, 9),
+            font=("Segoe UI", 10, "bold"))
+        mp("Accent.TButton", background=[("active", self.ACCENT_DARK), ("disabled", "#a9c1ef")],
+           foreground=[("disabled", "#f1f5fd")])
+
+        cfg("Success.TButton", background=self.SUCCESS, foreground="#ffffff", padding=(16, 9),
+            font=("Segoe UI", 10, "bold"))
+        mp("Success.TButton", background=[("active", self.SUCCESS_DARK), ("disabled", "#a7d6bb")],
+           foreground=[("disabled", "#f0faf4")])
+
+        cfg("Danger.TButton", background="#fdeaea", foreground=self.ERROR, padding=(14, 8), font=base_font)
+        mp("Danger.TButton", background=[("active", "#fbd7d7"), ("disabled", "#f7efef")],
+           foreground=[("disabled", "#dba9a9")])
+
+        cfg("Link.TButton", background=self.BG, foreground=self.ACCENT, padding=(4, 2), font=("Segoe UI", 9))
+        mp("Link.TButton", background=[("active", self.BG)], foreground=[("active", self.ACCENT_DARK)])
+
+        cfg("TNotebook", background=self.BG, borderwidth=0, tabmargins=(2, 6, 2, 0))
+        cfg("TNotebook.Tab", background="#e7ebf5", foreground=self.MUTED, padding=(18, 9), font=base_font)
+        mp("TNotebook.Tab", background=[("selected", self.CARD_BG)], foreground=[("selected", self.ACCENT)])
+
+        cfg("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground=self.TEXT,
+            rowheight=26, font=("Segoe UI", 9), borderwidth=0)
+        cfg("Treeview.Heading", background="#eef1f7", foreground=self.TEXT, font=("Segoe UI", 9, "bold"),
+            relief="flat")
+        mp("Treeview.Heading", background=[("active", "#e2e7f2")])
+        mp("Treeview", background=[("selected", self.ACCENT)], foreground=[("selected", "#ffffff")])
+
+        cfg("TScrollbar", background="#e7ebf5", troughcolor=self.BG, bordercolor=self.BG, arrowcolor=self.MUTED)
+
+    # ------------------------------------------------------------------
+    # Построение интерфейса
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        self._setup_style()
+        self._build_menu()
+
+        root = ttk.Frame(self, padding=(16, 14, 16, 12))
+        root.pack(fill="both", expand=True)
+
+        self._build_header(root)
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True, pady=(12, 12))
+
+        search_tab = ttk.Frame(self.notebook, padding=12)
+        results_tab = ttk.Frame(self.notebook, padding=12)
+        log_tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook.add(search_tab, text="Поиск")
+        self.notebook.add(results_tab, text="Результаты")
+        self.notebook.add(log_tab, text="Журнал")
+
+        self._build_search_tab(search_tab)
+        self._build_results_tab(results_tab)
+        self._build_log_tab(log_tab)
+
+        self._build_action_bar(root)
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Выгрузить в Excel…", command=self.export)
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self.destroy)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+
+        sites_menu = tk.Menu(menubar, tearoff=False)
+        sites_menu.add_command(label="Открыть ЕИС",
+                                command=lambda: webbrowser.open(EIS + "/epz/order/extendedsearch/results.html"))
+        sites_menu.add_command(label="Открыть ТЭК-Торг",
+                                command=lambda: webbrowser.open("https://www.tektorg.ru/market/procedures"))
+        menubar.add_cascade(label="Площадки", menu=sites_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="О программе", command=self._show_about)
+        menubar.add_cascade(label="Справка", menu=help_menu)
+        self.configure(menu=menubar)
+
+    def _build_header(self, parent):
+        header = ttk.Frame(parent)
+        header.pack(fill="x")
+        title_box = ttk.Frame(header)
+        title_box.pack(side="left")
+        title_label = ttk.Label(title_box, style="Header.TLabel")
+        try:
+            title_label.configure(text="🚚 Мониторинг закупок автомобильных перевозок")
+        except tk.TclError:
+            # Старые сборки Tcl/Tk (< 8.6.10, Python 3.8) не принимают символы вне BMP.
+            title_label.configure(text="Мониторинг закупок автомобильных перевозок")
+        title_label.pack(anchor="w")
+        ttk.Label(title_box, text="ЕИС 44/223-ФЗ • ТЭК-Торг: КИМ, Роснефть, запросы (Т)КП • выгрузка в Excel",
+                  style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+        links = ttk.Frame(header)
+        links.pack(side="right", anchor="n")
+        ttk.Button(links, text="ЕИС ↗", style="Link.TButton",
+                   command=lambda: webbrowser.open(EIS + "/epz/order/extendedsearch/results.html")).pack(side="right")
+        ttk.Button(links, text="ТЭК-Торг ↗", style="Link.TButton",
+                   command=lambda: webbrowser.open("https://www.tektorg.ru/market/procedures")).pack(
+            side="right", padx=(0, 6))
+
+    def _build_search_tab(self, parent):
+        today = datetime.now()
+        self.date_from = tk.StringVar(value=(today - timedelta(days=14)).strftime("%d.%m.%Y"))
+        self.date_to = tk.StringVar(value=today.strftime("%d.%m.%Y"))
+        self.region = tk.StringVar(value="Все регионы")
+        self.customer = tk.StringVar()
+        self.active = tk.BooleanVar(value=True)
+        self.enrich = tk.BooleanVar(value=True)
+        self.insecure = tk.BooleanVar(value=False)
+        self.include_eis = tk.BooleanVar(value=True)
+        self.include_market = tk.BooleanVar(value=True)
+        self.include_rosneft = tk.BooleanVar(value=True)
+        self.include_rosnefttkp = tk.BooleanVar(value=True)
+
+        form = ttk.LabelFrame(parent, text="Период, регион и заказчик", style="Card.TLabelframe", padding=14)
+        form.pack(fill="x")
+        labels = [("Дата публикации с:", self.date_from), ("по:", self.date_to)]
+        for col, (txt, var) in enumerate(labels):
+            ttk.Label(form, text=txt, style="Card.TLabel").grid(
+                row=0, column=col * 2, sticky="w", padx=(0, 6), pady=(0, 10))
+            ttk.Entry(form, textvariable=var, width=14).grid(
+                row=0, column=col * 2 + 1, sticky="w", padx=(0, 18), pady=(0, 10))
+        ttk.Label(form, text="Регион:", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 10))
+        cb = ttk.Combobox(form, textvariable=self.region, values=list(REGIONS), state="readonly", width=43)
+        cb.grid(row=1, column=1, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(form, text="Заказчик содержит:", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Entry(form, textvariable=self.customer, width=60).grid(row=2, column=1, columnspan=3, sticky="ew")
+        form.columnconfigure(3, weight=1)
+
+        sources = ttk.LabelFrame(parent, text="Источники", style="Card.TLabelframe", padding=12)
+        sources.pack(fill="x", pady=(12, 0))
+        ttk.Checkbutton(sources, text="ЕИС — 44-ФЗ и 223-ФЗ", variable=self.include_eis).pack(side="left")
+        ttk.Checkbutton(sources, text="ТЭК-Торг — КИМ", variable=self.include_market).pack(side="left", padx=14)
+        ttk.Checkbutton(sources, text="ТЭК-Торг — Роснефть", variable=self.include_rosneft).pack(side="left")
+        ttk.Checkbutton(sources, text="Роснефть — запросы (Т)КП", variable=self.include_rosnefttkp).pack(
+            side="left", padx=14)
+
+        kw_frame = ttk.LabelFrame(parent, text="Поиск по ключевым словам (по одному запросу в строке)",
+                                   style="Card.TLabelframe", padding=12)
+        kw_frame.pack(fill="x", pady=(12, 0))
+        self.keywords = tk.Text(
+            kw_frame, height=6, wrap="word", font=("Segoe UI", 9),
+            bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT, relief="flat",
+            highlightthickness=1, highlightbackground=self.BORDER, highlightcolor=self.ACCENT,
+            padx=8, pady=6,
+        )
+        self.keywords.pack(fill="x")
+        self.keywords.insert("1.0", "\n".join(DEFAULT_KEYWORDS))
+        ttk.Button(kw_frame, text="Сбросить к значениям по умолчанию", style="Link.TButton",
+                   command=self._reset_keywords).pack(anchor="e", pady=(6, 0))
+
+        opts = ttk.LabelFrame(parent, text="Дополнительные параметры", style="Card.TLabelframe", padding=12)
+        opts.pack(fill="x", pady=(12, 0))
+        opts_row = ttk.Frame(opts, style="Card.TFrame")
+        opts_row.pack(fill="x")
+        ttk.Checkbutton(opts_row, text="Только этап «Подача заявок»", variable=self.active).pack(side="left")
+        ttk.Checkbutton(opts_row, text="Искать транспорт в карточке и документации (медленнее)",
+                         variable=self.enrich).pack(side="left", padx=18)
+        ttk.Checkbutton(opts_row, text="Игнорировать проверку сертификата TLS", variable=self.insecure).pack(
+            side="left")
+        ttk.Label(
+            opts,
+            text="Поиск транспорта в документации даёт более точный результат, но заметно увеличивает время поиска.",
+            style="CardMuted.TLabel", wraplength=980,
+        ).pack(anchor="w", pady=(8, 0))
+
+    def _reset_keywords(self):
+        self.keywords.delete("1.0", "end")
+        self.keywords.insert("1.0", "\n".join(DEFAULT_KEYWORDS))
+
+    def _build_results_tab(self, parent):
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x")
+        self.results_count_var = tk.StringVar(value="Нет данных — запустите поиск на вкладке «Поиск»")
+        ttk.Label(toolbar, textvariable=self.results_count_var, style="Muted.TLabel").pack(side="left")
+        ttk.Label(toolbar, text="Фильтр:", style="Muted.TLabel").pack(side="left", padx=(18, 6))
+        self.result_filter = tk.StringVar()
+        self.result_filter.trace_add("write", lambda *_: self._apply_result_filter())
+        ttk.Entry(toolbar, textvariable=self.result_filter, width=32).pack(side="left")
+        ttk.Label(toolbar, text="Дважды щёлкните строку, чтобы открыть закупку в браузере.",
+                  style="Muted.TLabel").pack(side="right")
+
+        tree_frame = ttk.Frame(parent, style="Card.TFrame")
+        tree_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(
+            tree_frame, columns=self.RESULT_COLUMNS, show="headings", selectmode="browse", height=14,
+        )
+        for col in self.RESULT_COLUMNS:
+            self.tree.heading(col, text=self.RESULT_HEADINGS[col], command=lambda c=col: self._sort_tree(c, False))
+            anchor = "e" if col == "nmck" else "w"
+            self.tree.column(col, width=self.RESULT_WIDTHS[col], anchor=anchor, stretch=(col == "title"))
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.tree.tag_configure("odd", background=self.ROW_ALT_BG)
+        self.tree.tag_configure("even", background="#ffffff")
+        self.tree.bind("<Double-1>", self._open_selected_link)
+
+    def _build_log_tab(self, parent):
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="Здесь отображается ход поиска в реальном времени.",
+                  style="Muted.TLabel").pack(side="left")
+        ttk.Button(toolbar, text="Копировать", command=self._copy_log).pack(side="right")
+        ttk.Button(toolbar, text="Очистить", command=self._clear_log).pack(side="right", padx=(0, 8))
+
+        log_frame = ttk.Frame(parent, style="Card.TFrame")
+        log_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.log = tk.Text(
+            log_frame, height=10, state="disabled", wrap="word", font=("Consolas", 9),
+            bg="#ffffff", fg=self.TEXT, relief="flat",
+            highlightthickness=1, highlightbackground=self.BORDER,
+            padx=10, pady=8,
+        )
+        self.log.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.log.configure(yscrollcommand=sb.set)
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        self.log.tag_configure("timestamp", foreground=self.MUTED)
+        self.log.tag_configure("info", foreground=self.TEXT)
+        self.log.tag_configure("success", foreground=self.SUCCESS)
+        self.log.tag_configure("warning", foreground=self.WARNING)
+        self.log.tag_configure("error", foreground=self.ERROR)
+
+    def _build_action_bar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x")
+        buttons = ttk.Frame(bar)
+        buttons.pack(fill="x")
+        self.run_btn = ttk.Button(buttons, text="▶  Найти закупки", style="Accent.TButton", command=self.start)
+        self.run_btn.pack(side="left")
+        self.stop_btn = ttk.Button(buttons, text="Остановить", style="Danger.TButton", command=self.stop,
+                                    state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        self.export_btn = ttk.Button(buttons, text="Выгрузить в Excel", style="Success.TButton",
+                                      command=self.export, state="disabled")
+        self.export_btn.pack(side="left", padx=(8, 0))
+
+        status_row = ttk.Frame(bar)
+        status_row.pack(fill="x", pady=(10, 0))
+        self.status_dot = tk.Label(status_row, text="●", font=("Segoe UI", 12), fg=self.MUTED, bg=self.BG, bd=0)
+        self.status_dot.pack(side="left")
+        self.status_var = tk.StringVar(value="Готово к работе")
+        ttk.Label(status_row, textvariable=self.status_var, style="Sub.TLabel").pack(side="left", padx=(6, 0))
+
+        # Вместо стандартной «бегающей» полосы — синий грузовик, который едет
+        # по дороге, пока идёт поиск. Методы start()/stop() совместимы.
+        self.progress = TruckProgress(bar, bg=self.BG, truck_color=self.ACCENT)
+        self.progress.pack(fill="x", pady=(8, 0))
+
+    # ------------------------------------------------------------------
+    # Журнал и индикатор статуса
+    # ------------------------------------------------------------------
+    def _set_status(self, kind: str, text: str):
+        self.status_var.set(text)
+        color = self.STATUS_COLORS.get(kind, self.MUTED)
+        try:
+            self.status_dot.configure(fg=color)
+        except Exception:
+            pass
+
+    def add_log(self, text: str):
+        """Потокобезопасно добавляет строку в журнал (вызывается из фонового потока)."""
+        self.after(0, self._add_log_ui, text)
+
+    def _add_log_ui(self, text: str):
+        tag, status_kind = _classify_log_line(text)
+        self._set_status(status_kind, text)
+        self.log.configure(state="normal")
+        self.log.insert("end", f"[{datetime.now():%H:%M:%S}] ", ("timestamp",))
+        self.log.insert("end", f"{text}\n", (tag,))
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _clear_log(self):
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+    def _copy_log(self):
+        content = self.log.get("1.0", "end")
+        self.clipboard_clear()
+        self.clipboard_append(content)
+
+    def _show_about(self):
+        messagebox.showinfo(
+            "О программе",
+            f"{APP_NAME}\nВерсия {APP_VERSION}\n\n"
+            "Мониторинг открытых закупок автомобильных перевозок в ЕИС и ТЭК-Торг "
+            "с автоматическим извлечением марки/модели транспорта и выгрузкой в Excel.\n\n"
+            "Перед подачей заявки всегда проверяйте актуальную карточку закупки на площадке.",
+        )
+
+    # ------------------------------------------------------------------
+    # Вкладка «Результаты»
+    # ------------------------------------------------------------------
+    def _refresh_results_view(self):
+        self._tree_rows = {str(i): t for i, t in enumerate(self.rows)}
+        if self.result_filter.get():
+            self.result_filter.set("")  # сброс фильтра сам вызовет перерисовку через trace
+        else:
+            self._apply_result_filter()
+
+    def _apply_result_filter(self):
+        query = self.result_filter.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for iid, t in self._tree_rows.items():
+            haystack = f"{t.number} {t.title} {t.transport} {t.customer} {t.region} {t.matched_keyword}".lower()
+            if query and query not in haystack:
+                continue
+            nmck = f"{t.nmck:,.2f}".replace(",", " ") if t.nmck is not None else ""
+            values = (t.number, t.title, t.transport, nmck, t.region, t.customer, t.deadline, t.etp)
+            tag = "odd" if shown % 2 else "even"
+            self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+            shown += 1
+        total = len(self._tree_rows)
+        if total == 0:
+            self.results_count_var.set("Нет данных — запустите поиск на вкладке «Поиск»")
+        elif query:
+            self.results_count_var.set(f"Показано {shown} из {total}")
+        else:
+            self.results_count_var.set(f"Найдено закупок: {total}")
+
+    def _sort_tree(self, col: str, reverse: bool):
+        items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children("")]
+
+        def sort_key(pair):
+            value = pair[0]
+            if col == "nmck":
+                try:
+                    return (0, float(value.replace(" ", "").replace(",", ".")))
+                except ValueError:
+                    return (-1, 0.0)
+            if col == "deadline":
+                parsed = parse_ddmmyyyy(value)
+                return (0, parsed) if parsed else (-1, datetime.min)
+            return (0, value.lower())
+
+        items.sort(key=sort_key, reverse=reverse)
+        for index, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", index)
+        self.tree.heading(col, command=lambda: self._sort_tree(col, not reverse))
+
+    def _open_selected_link(self, event=None):
+        if event is not None:
+            iid = self.tree.identify_row(event.y)
+        else:
+            selection = self.tree.selection()
+            iid = selection[0] if selection else None
+        if not iid:
+            return
+        t = self._tree_rows.get(iid)
+        if not t:
+            return
+        url = t.etp_url or t.eis_url
+        if url:
+            webbrowser.open(url)
+        else:
+            messagebox.showinfo("Нет ссылки", "Для этой закупки не найдена ссылка на электронную площадку.")
+
+    # ------------------------------------------------------------------
+    # Логика поиска и выгрузки (не изменена по сути, только код GUI-обвязки)
+    # ------------------------------------------------------------------
+    def _get_keywords(self) -> list[str]:
+        """Возвращает поисковые фразы построчно, без пустых строк и дублей."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for line in self.keywords.get("1.0", "end").splitlines():
+            kw = line.strip()
+            if kw and kw.lower() not in seen:
+                seen.add(kw.lower())
+                result.append(kw)
+        return result
+
+    def validate(self) -> bool:
+        for value in (self.date_from.get(), self.date_to.get()):
+            if not parse_ddmmyyyy(value):
+                messagebox.showerror("Ошибка", "Дата должна быть в формате ДД.ММ.ГГГГ")
+                return False
+        if parse_ddmmyyyy(self.date_from.get()) > parse_ddmmyyyy(self.date_to.get()):
+            messagebox.showerror("Ошибка", "Начальная дата позже конечной")
+            return False
+        if not self._get_keywords():
+            messagebox.showerror("Ошибка", "Укажите хотя бы одну поисковую фразу")
+            return False
+        if not any((self.include_eis.get(), self.include_market.get(),
+                    self.include_rosneft.get(), self.include_rosnefttkp.get())):
+            messagebox.showerror("Ошибка", "Выберите хотя бы один источник")
+            return False
+        return True
+
+    def start(self):
+        if not self.validate():
+            return
+        self.stop_event.clear()
+        self.rows = []
+        self._refresh_results_view()
+        self.run_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.export_btn.configure(state="disabled")
+        self.progress.start(10)
+        self.notebook.select(0)
+        self._set_status("running", "Выполняется поиск…")
+        kws = self._get_keywords()
+        args = (self.date_from.get(), self.date_to.get(), self.region.get(), self.customer.get().strip(),
+                kws, self.active.get(), self.enrich.get(), self.add_log, self.stop_event, self.insecure.get(),
+                self.include_eis.get(), self.include_market.get(), self.include_rosneft.get(),
+                self.include_rosnefttkp.get(), [], [])
+        threading.Thread(target=self._worker, args=args, daemon=True).start()
+
+    def _worker(self, *args):
+        try:
+            self.rows = collect_tenders(*args)
+            self.add_log(f"Готово. Найдено уникальных закупок: {len(self.rows)}")
+            self.after(0, self._refresh_results_view)
+            self.after(0, lambda: self.export_btn.configure(state="normal" if self.rows else "disabled"))
+        except Exception as exc:
+            # Текст ошибки фиксируем сразу: переменная `exc` удаляется при выходе
+            # из блока except, а lambda выполняется позже в главном потоке.
+            message = str(exc)
+            _log_exception("Ошибка при поиске закупок", *sys.exc_info())
+            self.add_log("ОШИБКА: " + message)
+            self.after(0, lambda msg=message: messagebox.showerror(
+                "Ошибка получения данных",
+                msg + "\n\nПроверьте Интернет. Для ЕИС можно временно включить флажок TLS; "
+                      "для ТЭК-Торг пройдите проверку в окне Яндекс Браузера. См. README.",
+            ))
+        finally:
+            self.after(0, self._finish)
+
+    def _finish(self):
+        self.progress.stop()
+        self.run_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+
+    def stop(self):
+        self.stop_event.set()
+        self.add_log("Запрошена остановка…")
+
+    def export(self):
+        if not self.rows:
+            messagebox.showinfo("Нет данных", "Сначала выполните поиск — экспортировать пока нечего.")
+            return
+        default = f"Закупки_автоперевозки_{datetime.now():%Y-%m-%d}.xlsx"
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", initialfile=default,
+                                             filetypes=[("Excel", "*.xlsx")])
+        if not path:
+            return
+        keywords = self._get_keywords()
+        params = {
+            "Период": f"{self.date_from.get()} — {self.date_to.get()}", "Регион": self.region.get(),
+            "Фильтр по заказчику": self.customer.get() or "не задан",
+            "Только подача заявок": "да" if self.active.get() else "нет",
+            "Поисковые фразы": "; ".join(keywords),
+            "Режим поиска": "только по ключевым словам; поиск по ОКВЭД2 и ОКПД2 отключен",
+            "Источники": "; ".join([
+                name for enabled, name in [
+                    (self.include_eis.get(), "ЕИС 44/223-ФЗ"),
+                    (self.include_market.get(), "ТЭК-Торг КИМ"),
+                    (self.include_rosneft.get(), "ТЭК-Торг Роснефть"),
+                    (self.include_rosnefttkp.get(), "Роснефть запросы (Т)КП"),
+                ] if enabled
+            ]),
+        }
+        try:
+            export_xlsx(self.rows, path, params)
+            self._last_export_path = path
+            messagebox.showinfo("Готово", f"Файл сохранен:\n{path}")
+            if os.name == "nt":
+                os.startfile(path)
+        except Exception as exc:
+            messagebox.showerror("Ошибка сохранения", str(exc))
+
+
+def _report_fatal_error(exc: BaseException) -> None:
+    """Показывает необработанную ошибку пользователю вместо молчаливого закрытия окна."""
+    log_path = _log_exception("Необработанная ошибка", type(exc), exc, exc.__traceback__)
+    details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    message = (
+        f"Не удалось запустить программу:\n{exc}\n\n"
+        + (f"Подробности записаны в файл:\n{log_path}\n\n" if log_path else "")
+        + "Последние строки:\n" + details[-1200:]
+    )
+    _fail_startup(message)
+
+
+def _install_thread_excepthook() -> None:
+    """Ошибки в фоновых потоках попадают в error.log, а не исчезают бесследно."""
+    if not hasattr(threading, "excepthook"):
+        return
+
+    def hook(args):
+        _log_exception(f"Ошибка в потоке {getattr(args.thread, 'name', '?')}",
+                       args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = hook
+
+
+def main() -> int:
+    _install_thread_excepthook()
+    try:
+        app = App()
+    except Exception as exc:  # Ошибка построения окна: показать причину, а не молча закрыться.
+        _report_fatal_error(exc)
+        return 1
+    # Ошибки внутри обработчиков кнопок Tkinter выводит только в консоль (которой
+    # у pythonw.exe нет). Дублируем их в error.log и во всплывающее окно.
+    def _tk_callback_error(exc_type, exc_value, exc_tb):
+        log_path = _log_exception("Ошибка в обработчике интерфейса", exc_type, exc_value, exc_tb)
+        try:
+            messagebox.showerror(
+                APP_NAME,
+                f"Ошибка: {exc_value}\n\n" + (f"Подробности: {log_path}" if log_path else ""),
+            )
+        except Exception:
+            pass
+
+    app.report_callback_exception = _tk_callback_error
+    try:
+        app.mainloop()
+    except Exception as exc:
+        _report_fatal_error(exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
