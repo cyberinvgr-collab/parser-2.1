@@ -7,7 +7,7 @@ rem  Двойной щелчок по этому файлу:
 rem    1) находит установленный Python 3.10+ (py-лаунчер или python в PATH);
 rem    2) при первом запуске создаёт окружение .venv рядом с программой
 rem       и ставит в него библиотеки из requirements.txt
-rem       (requests, beautifulsoup4, openpyxl, pypdf, playwright);
+rem       (requests, beautifulsoup4, openpyxl, playwright);
 rem    3) запускает программу. Если она упала — окно НЕ закроется,
 rem       ошибка останется на экране (и запишется в error.log).
 rem ============================================================
@@ -72,7 +72,7 @@ if not exist "%STAMP%" (
     fc /b requirements.txt "%STAMP%" >nul 2>nul
     if errorlevel 1 set "NEED_INSTALL=1"
 )
-%RUN_PY% -c "import requests, bs4, openpyxl, pypdf, playwright.sync_api" >nul 2>nul
+%RUN_PY% -c "import requests, bs4, openpyxl, playwright.sync_api" >nul 2>nul
 if errorlevel 1 set "NEED_INSTALL=1"
 if "%NEED_INSTALL%"=="1" call :install_deps
 if errorlevel 1 exit /b 1
@@ -111,7 +111,7 @@ if errorlevel 1 (
     exit /b 1
 )
 rem Контрольная проверка: все модули должны импортироваться.
-%RUN_PY% -c "import requests, bs4, openpyxl, pypdf, playwright.sync_api" >nul 2>nul
+%RUN_PY% -c "import requests, bs4, openpyxl, playwright.sync_api" >nul 2>nul
 if errorlevel 1 (
     echo.
     echo  [ОШИБКА] Библиотеки установлены, но не импортируются. Удалите папку .venv
@@ -121,7 +121,7 @@ if errorlevel 1 (
     exit /b 1
 )
 copy /y requirements.txt "%STAMP%" >nul
-echo  Библиотеки установлены: requests, beautifulsoup4, openpyxl, pypdf, playwright.
+echo  Библиотеки установлены: requests, beautifulsoup4, openpyxl, playwright.
 echo  Браузер для ТЭК-Торг отдельно не нужен: используется Яндекс Браузер / Edge / Chrome.
 exit /b 0
 

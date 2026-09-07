@@ -27,7 +27,7 @@ from urllib.parse import urlencode, urljoin, urlparse, parse_qs, unquote
 import xml.etree.ElementTree as ET
 
 APP_NAME = "Транспортные закупки — ЕИС и ТЭК-Торг"
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 MIN_PYTHON = (3, 10)  # playwright поддерживает только Python 3.10 и новее
 
 
@@ -56,13 +56,13 @@ def _log_exception(context: str, exc_type, exc_value, exc_tb) -> str:
 
 # Соответствие «имя модуля при импорте» → «имя пакета для pip». Нужно, чтобы
 # при отсутствии зависимости показать пользователю точную команду установки.
-# Все пакеты обязательны: без pypdf не читается PDF-документация, без
-# playwright нельзя обойти антибот-защиту ТЭК-Торг через браузер.
+# Обязательные пакеты нужны только для выдачи площадок, разбора HTML,
+# выгрузки и обхода антибот-защиты. Файлы документации больше не скачиваются
+# и не разбираются: это заметно ускоряет поиск и запуск программы.
 REQUIRED_PACKAGES = {
     "requests": "requests",
     "bs4": "beautifulsoup4",
     "openpyxl": "openpyxl",
-    "pypdf": "pypdf",
     "playwright": "playwright",
 }
 
@@ -122,7 +122,6 @@ try:
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.table import Table, TableStyleInfo
-    from pypdf import PdfReader
     from playwright.sync_api import sync_playwright
 except ImportError as _exc:
     _missing = REQUIRED_PACKAGES.get((_exc.name or "").split(".")[0], _exc.name or "?")
@@ -134,6 +133,14 @@ except ImportError as _exc:
         f"    {Path(sys.executable).name} -m pip install -r requirements.txt\n\n"
         f"Подробности: {_exc}"
     )
+
+# Оставлено необязательным только для обратной совместимости с прямым вызовом
+# extract_document_text(). Основной поиск эту функцию не вызывает и PDF не
+# скачивает, поэтому pypdf больше не требуется для запуска приложения.
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 try:
     import tkinter as tk
@@ -150,6 +157,10 @@ EIS = "https://zakupki.gov.ru"
 # Документация закупки может быть довольно большой. Ограничения защищают
 # поиск от случайной загрузки видео, архивов с большим количеством файлов и
 # бесконечно повторяющихся ссылок площадки.
+# Поиск по вложениям отключён: название техники берём только из карточки.
+# Константа оставлена явной, чтобы старый вспомогательный API не мог случайно
+# включить дорогой обход файлов.
+DOCUMENT_SCAN_ENABLED = False
 MAX_DOCUMENTS_TO_SCAN = 8
 MAX_DOCUMENT_SIZE = 20 * 1024 * 1024
 DOCUMENT_EXTENSIONS = {
@@ -235,16 +246,78 @@ GENERIC_VEHICLE_RE = re.compile(
 )
 RSS_URL = EIS + "/epz/order/extendedsearch/rss.html"
 
+# Короткий набор именно поисковых фраз. В старой версии сюда входили
+# отдельные марки, модели и типы техники. Они давали много лишних запросов
+# (закупка автомобиля, ремонт погрузчика и т. п.) и замедляли выдачу. Название
+# техники теперь уточняется только в карточке закупки, поэтому в запросах
+# оставлены транспортные услуги и их основные формулировки.
 DEFAULT_KEYWORDS = [
-    "перевозка грузов", "грузоперевозки", "автотранспортные услуги",
-    "транспортные услуги", "пассажирские перевозки", "перевозка пассажиров",
-    "легковой транспорт", "легковые автомобили", "автомобиль легковой",
-    "пикап", "внедорожник", "УАЗ Патриот", "УАЗ Профи",
-    "вахтовые перевозки", "фрахтование", "аренда спецтехники",
-    "услуги спецтехники", "аренда грузового транспорта с водителем",
-    "аренда автобуса с водителем", "аренда автомобиля с экипажем",
-    "седельный тягач", "седельные тягачи", "трал", "тралы",
-    "низкорамная платформа", "полуприцеп", "полуприцепы", "прицеп",
+    "перевозка грузов",
+    "грузоперевозки",
+    "автомобильные перевозки",
+    "автотранспортные услуги",
+    "транспортные услуги",
+    "услуги по перевозке",
+    "автомобильным транспортом",
+    "пассажирские перевозки",
+    "перевозка пассажиров",
+    "доставка грузов",
+    "доставка работников",
+    "вахтовые перевозки",
+    "транспортно-экспедиционные услуги",
+    "экспедирование грузов",
+    "предоставление транспорта с водителем",
+    "предоставление автотранспорта",
+    "аренда транспорта с водителем",
+    "аренда грузового транспорта с водителем",
+    "аренда автомобиля с экипажем",
+    "аренда автобуса с водителем",
+    "аренда спецтехники",
+    "аренда спецтехники с оператором",
+    "услуги спецтехники",
+    "фрахтование транспортных средств",
+    "машино-час",
+]
+
+# Эти слова показываются пользователю отдельно и применяются как локальный
+# фильтр. Добавлять их в запрос к площадке нельзя: запрос «ремонт техники»
+# вернёт как раз ненужные закупки. Фильтр работает по названию и описанию
+# закупки, а не по файлам документации.
+DEFAULT_EXCLUDE_KEYWORDS = [
+    "ремонт техники",
+    "ремонт автомобилей",
+    "ремонт автотранспорта",
+    "ремонт спецтехники",
+    "ремонт транспортных средств",
+    "кузовной ремонт",
+    "техническое обслуживание",
+    "техобслуживание",
+    "обслуживание автомобилей",
+    "диагностика техники",
+    "мойка техники",
+    "мойка автомобилей",
+    "мойка автотранспорта",
+    "мойка транспортных средств",
+    "мойка спецтехники",
+    "автомойка",
+    "очистка и мойка",
+    "химчистка автомобилей",
+    "детейлинг",
+    "покраска автомобилей",
+    "шиномонтаж",
+    "поставка запасных частей",
+    "поставка автозапчастей",
+    "замена масла",
+    "поставка автомобилей",
+    "поставка транспортных средств",
+    "поставка спецтехники",
+    "приобретение автомобиля",
+    "закупка автомобиля",
+    "продажа автомобилей",
+    "изготовление техники",
+    "заправка автомобилей",
+    "страхование транспортных средств",
+    "лизинг автомобилей",
 ]
 
 SUPPLIER_CATEGORY = "Исполнитель услуг (собственными силами)"
@@ -272,21 +345,106 @@ OKPD2_CODES = {
     "49.39.34.000": "Услуги по перевозке пассажиров и багажа автобусами по заказам в междугородном и международном сообщении",
     "49.39.39.000": "Услуги по перевозке пассажиров сухопутным транспортом прочие",
 }
+# Негативные признаки применяются до положительного классификатора. Сюда
+# попали не только ремонт и мойка, но и типовые закупки оборудования
+# и другие работы, которые часто ошибочно проходят по слову
+# «автомобиль».
 EXCLUDE_RE = re.compile(
-    r"\b(железнодорож|авиацион|воздушн(?:ым|ого)? транспорт|морск(?:ая|ие|им)|"
-    r"речн(?:ая|ые|ым)|водн(?:ым|ого) транспорт|трубопровод|багаж авиапассажир|"
-    r"почтов(?:ая|ые) пересыл)\w*", re.I
+    r"(?:"
+    r"ремонт\w*|ремонтно[- ]восстановит\w*|восстановлен\w*|"
+    r"техническ\w*\s+обслужив\w*|техобслужив\w*|"
+    r"(?:обслужив\w*|сервис\w*).{0,30}(?:автомобил\w*|автотранспорт\w*|"
+    r"транспортн\w*\s+средств\w*|техник\w*|спецтехник\w*|машин\w*)|"
+    r"(?:автомобил\w*|автотранспорт\w*|транспортн\w*\s+средств\w*|"
+    r"техник\w*|спецтехник\w*|машин\w*).{0,30}(?:обслужив\w*|сервис\w*)|"
+    r"диагностик\w*|дефектовк\w*|тюнинг\w*|переоборудован\w*|"
+    r"мойк\w*|автомойк\w*|автомоечн\w*|химчистк\w*|чистк\w*|детейлинг\w*|"
+    r"очистк\w*|уборк\w*|санитарн\w*\s+обработк\w*|"
+    r"шиномонтаж\w*|шиномонт\w*|вулканизац\w*|"
+    r"замен\w*\s+(?:масл\w*|шин\w*|аккумулятор\w*)|"
+    r"страхован\w*|лизинг\w*|"
+    r"железнодорож\w*|авиацион\w*|воздушн\w*\s+транспорт\w*|"
+    r"морск\w*\s+транспорт\w*|речн\w*\s+транспорт\w*|водн\w*\s+транспорт\w*|"
+    r"трубопровод\w*|багаж\w*\s+авиапассажир\w*|почтов\w*\s+пересыл\w*"
+    r")",
+    re.I,
 )
-ROAD_RE = re.compile(
-    r"(автомобил|автотранспорт|автобус|микроавтобус|легков|пикап|внедорожник|"
-    r"кроссовер|грузоперевоз|перевозк|транспортировк|тягач|седельн\w*.{0,20}тягач|"
-    r"трал\w*|полуприцеп\w*|прицеп\w*|низкорамн\w*.{0,20}платформ|"
-    r"фрахтован|спецтехник|аренд\w*.{0,40}(?:водител|экипаж|автобус|грузов)|"
-    r"доставк.{0,25}(?:работник|персонал|груз)|вахтов|экспедиц|такси|"
-    r"транспортн.{0,20}(?:обслужив|услуг))",
-    re.I | re.S,
+
+# Положительный классификатор требует одновременно транспортный объект и
+# признак услуги/перевозки. Благодаря этому «поставка автомобиля», «ремонт
+# автобуса» и просто «автобус» не попадают в результаты.
+TRANSPORT_SIGNAL_RE = re.compile(
+    r"(?:автомобил\w*|автотранспорт\w*|автобус\w*|микроавтобус\w*|"
+    r"легков\w*|грузов\w*|пикап\w*|внедорожник\w*|кроссовер\w*|"
+    r"тягач\w*|седельн\w*\s+тягач\w*|трал\w*|полуприцеп\w*|прицеп\w*|"
+    r"платформ\w*|спецтехник\w*|погрузчик\w*|экскаватор\w*|"
+    r"бульдозер\w*|автокран\w*|кран\w*|каток\w*|грейдер\w*|"
+    r"манипулятор\w*|самосвал\w*|фургон\w*|рефрижератор\w*|"
+    r"цистерн\w*|бензовоз\w*|автовоз\w*|лесовоз\w*|эвакуатор\w*|трактор\w*|такси|"
+    r"транспорт\w*|перевоз\w*|грузоперевоз\w*|пассажироперевоз\w*|"
+    r"доставк\w*|экспедиц\w*|фрахт\w*|вахтов\w*|вывоз\w*|машино[- ]?час\w*|"
+    r"аренд\w*\s+(?:автомобил\w*|транспорт\w*|автобус\w*|спецтехник\w*|"
+    r"тягач\w*|прицеп\w*|погрузчик\w*)"
+    r")",
+    re.I,
 )
+SERVICE_SIGNAL_RE = re.compile(
+    r"(?:перевоз\w*|грузоперевоз\w*|пассажироперевоз\w*|"
+    r"транспортиров\w*|достав\w*|экспедиц\w*|фрахт\w*|"
+    r"аренд\w*|предоставлен\w*|оказан\w*\s+услуг\w*|услуг\w*|"
+    r"обслужив\w*|эксплуатац\w*|вывоз\w*|машино[- ]?час\w*|"
+    r"сопровожд\w*\s+(?:груз\w*|перевоз\w*|транспорт\w*)"
+    r")",
+    re.I,
+)
+SUPPLY_RE = re.compile(
+    r"(?:постав\w*|приобрет\w*|закуп\w*|покуп\w*|продаж\w*|"
+    r"изготов\w*|производств\w*)",
+    re.I,
+)
+SUPPLY_VEHICLE_RE = re.compile(
+    r"(?:постав\w*|приобрет\w*|закуп\w*|покуп\w*|продаж\w*|"
+    r"изготов\w*|производств\w*).{0,60}"
+    r"(?:автомобил\w*|автобус\w*|автотранспорт\w*|"
+    r"транспортн\w*\s+средств\w*|грузов\w*\s+транспорт\w*|"
+    r"спецтехник\w*|погрузчик\w*|экскаватор\w*|прицеп\w*|тягач\w*)",
+    re.I,
+)
+NON_TRANSPORT_SERVICE_RE = re.compile(
+    r"(?:заправк\w*|топливоснабжен\w*|шиномонтаж\w*|"
+    r"вулканизац\w*|замен\w*\s+(?:масл\w*|шин\w*|аккумулятор\w*))",
+    re.I,
+)
+TRANSPORT_ACTION_RE = re.compile(
+    r"(?:перевоз\w*|транспортиров\w*|достав\w*|экспедиц\w*|"
+    r"фрахт\w*|вывоз\w*|вахтов\w*)",
+    re.I,
+)
+# Сохраняем имя ROAD_RE для совместимости с внешними скриптами: теперь это
+# именно транспортный сигнал, а не безусловное разрешение записи.
+ROAD_RE = TRANSPORT_SIGNAL_RE
 TRANSPORT_PRODUCT_RE = re.compile(r"\bпоставк\w*.{0,80}\b(?:для|в целях)\s+перевозк", re.I | re.S)
+
+
+def _compile_exclude_pattern(values: list[str] | tuple[str, ...] | re.Pattern | None) -> re.Pattern:
+    """Собирает один regex для пользовательских слов исключения.
+
+    Компиляция выполняется один раз перед выдачей, а не для каждой карточки.
+    Для пользовательских фраз достаточно гибкого пробела между словами; базовые
+    морфологические варианты (ремонт, ремонтный, ремонтом) покрывает EXCLUDE_RE.
+    """
+    if isinstance(values, re.Pattern):
+        return values
+    custom: list[str] = []
+    for value in values or ():
+        words = re.findall(r"[\wЁёА-Яа-я-]+", str(value).casefold())
+        if not words:
+            continue
+        custom.append(r"\s+".join(re.escape(word) for word in words))
+    if not custom:
+        return EXCLUDE_RE
+    return re.compile(r"(?:" + EXCLUDE_RE.pattern + "|" + "|".join(custom) + r")", re.I)
+
 
 REGIONS = {
     "Все регионы": "",
@@ -670,13 +828,19 @@ MAX_PDF_PAGES = 60
 
 
 def _extract_pdf_text(data: bytes) -> str:
-    """Читает текстовый слой PDF через pypdf.
+    """Читает текстовый слой PDF через pypdf при наличии обратной совместимости.
+
+    Функция оставлена для внешних вызовов старого API, но основной парсер
+    документы не загружает и не вызывает её.
+
 
     Площадки часто выкладывают PDF с «защитой от копирования» — файл
     зашифрован пустым паролем пользователя. Такие документы расшифровываются
     прозрачно. Файлы с настоящим паролем и сканы без текстового слоя
     возвращают пустую строку и не прерывают поиск.
     """
+    if PdfReader is None:
+        return ""
     try:
         reader = PdfReader(io.BytesIO(data), strict=False)
         if reader.is_encrypted:
@@ -928,7 +1092,7 @@ def _scan_transport_documents(
     document_loader: Callable[[str], bytes] | None,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[str, str]:
-    if document_loader is None:
+    if not DOCUMENT_SCAN_ENABLED or document_loader is None:
         return "", ""
     found: list[str] = []
     source_urls: list[str] = []
@@ -981,15 +1145,11 @@ def enrich_from_detail(
     page_transport = extract_transport_name(page_text)
     if page_transport:
         t.transport = _merge_transport_values(t.transport, page_transport)
-    if document_loader:
-        document_transport, source_url = _scan_transport_documents(
-            page, t.eis_url or EIS, document_loader, progress
-        )
-        if document_transport:
-            # Точное значение из ТЗ/спецификации важнее общего слова «автобус»
-            # на странице карточки.
-            t.transport = _merge_transport_values(document_transport, t.transport)
-            t.documentation_url = source_url
+    # Файлы документации намеренно не скачиваем и не разбираем. Раньше здесь
+    # последовательно загружалось до восьми PDF/DOCX/XLSX на каждую карточку;
+    # это было главным источником задержек и не нужно для отбора услуг.
+    # Аргумент document_loader оставлен для совместимости со старыми вызовами,
+    # но больше не используется.
     found_okpd = sorted(set(re.findall(r"(?<!\d)(?:49\.41\.(?:14|15|18|20)\.000|49\.39\.(?:31|33|34|39)\.000)(?!\d)", page_text)))
     if found_okpd:
         t.okpd2 = "; ".join(f"{c} — {OKPD2_CODES.get(c, '')}".rstrip(" —") for c in found_okpd)
@@ -1484,13 +1644,8 @@ def enrich_tektorg_detail(
     page_transport = extract_transport_name(page_text)
     if page_transport:
         t.transport = _merge_transport_values(t.transport, page_transport)
-    if document_loader:
-        document_transport, source_url = _scan_transport_documents(
-            page, t.etp_url, document_loader, progress
-        )
-        if document_transport:
-            t.transport = _merge_transport_values(document_transport, t.transport)
-            t.documentation_url = source_url
+    # Документы ТЭК-Торг также не скачиваются: название транспорта берётся из
+    # карточки/названия процедуры, а не из ТЗ и вложений.
     found_okved = sorted(set(re.findall(r"(?<!\d)(?:49\.41\.[123]|49\.42|49\.31\.21|49\.39\.(?:31|33|34))(?!\d)", page_text)))
     found_okpd = sorted(set(re.findall(r"(?<!\d)(?:49\.41\.(?:14|15|18|20)\.000|49\.39\.(?:31|33|34|39)\.000)(?!\d)", page_text)))
     if found_okved:
@@ -1505,9 +1660,14 @@ def enrich_tektorg_detail(
 def collect_tektorg(date_from: str, date_to: str, region_name: str, customer_filter: str,
                      keywords: list[str], active_only: bool, sections: list[str],
                      progress: Callable[[str], None], stop_event: threading.Event,
-                     okved_codes: list[str], okpd_codes: list[str]) -> list[Tender]:
+                     okved_codes: list[str] | None = None, okpd_codes: list[str] | None = None,
+                     enrich: bool = False,
+                     exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None) -> list[Tender]:
     browser = TekTorgBrowser(progress)
     unique: dict[str, Tender] = {}
+    okved_codes = okved_codes or []
+    okpd_codes = okpd_codes or []
+    exclude_pattern = _compile_exclude_pattern(exclude_keywords)
     d1, d2 = parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)
     bases = {
         "market": "https://www.tektorg.ru/market/procedures",
@@ -1556,7 +1716,7 @@ def collect_tektorg(date_from: str, date_to: str, region_name: str, customer_fil
                         pub = parse_ddmmyyyy(t.published)
                         if pub and ((d1 and pub < d1) or (d2 and pub > d2)):
                             continue
-                        if not matches_road_transport(t):
+                        if not matches_road_transport(t, exclude_pattern):
                             # При поиске по профильному коду доверяем классификатору,
                             # даже если краткое название не содержит слова «перевозка».
                             if param_name not in ("okved2", "okpd2"):
@@ -1578,23 +1738,29 @@ def collect_tektorg(date_from: str, date_to: str, region_name: str, customer_fil
                         else:
                             unique[key] = t
                     progress(f"ТЭК-Торг {section}: страница {page_no}, всего подходящих {len(unique)}")
-                    time.sleep(0.4)
-        # Детализация только уже отобранных карточек.
+                    # Небольшая пауза сохраняет щадящий режим для площадки,
+                    # но не добавляет прежние 0,4 секунды к каждой странице.
+                    time.sleep(0.1)
+        # Детализация карточек опциональна. Вложения во всех режимах
+        # намеренно не загружаются; при включении enrich читается только HTML
+        # карточки для региона, срока и названия транспорта.
         items = list(unique.values())
-        for i, t in enumerate(items, 1):
-            if stop_event.is_set():
-                break
-            progress(f"ТЭК-Торг: уточнение региона {i}/{len(items)} — № {t.number}")
-            try:
-                enrich_tektorg_detail(
-                    t,
-                    browser.get(t.etp_url),
-                    document_loader=lambda url, referer=t.etp_url: browser.get_document(url, referer),
-                    progress=progress,
-                )
-            except Exception as exc:
-                progress(f"Предупреждение ТЭК-Торг № {t.number}: {exc}")
-            time.sleep(0.25)
+        # Для выбранного региона карточку всё равно нужно открыть: в списке
+        # ТЭК-Торг регион часто отсутствует. Это единственный обязательный
+        # запрос детализации в быстром режиме, вложения не затрагиваются.
+        if enrich or region_name != "Все регионы":
+            for i, t in enumerate(items, 1):
+                if stop_event.is_set():
+                    break
+                progress(f"ТЭК-Торг: уточнение карточки {i}/{len(items)} — № {t.number}")
+                try:
+                    enrich_tektorg_detail(
+                        t,
+                        browser.get(t.etp_url),
+                        progress=progress,
+                    )
+                except Exception as exc:
+                    progress(f"Предупреждение ТЭК-Торг № {t.number}: {exc}")
         # Регион проверяется после детализации. Если площадка не указала регион — запись сохраняется.
         if region_name != "Все регионы":
             target = region_name.lower().replace(" — ", " ")
@@ -1618,15 +1784,54 @@ def build_rss_url(keyword: str, date_from: str, date_to: str, region_code: str, 
     return RSS_URL + "?" + urlencode(params)
 
 
-def matches_road_transport(t: Tender) -> bool:
-    text = f"{t.title} {t.procedure}".lower()
-    if TRANSPORT_PRODUCT_RE.search(text) and "услуг" not in text:
+def matches_road_transport(
+    t: Tender,
+    exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None,
+) -> bool:
+    """Оставляет только автомобильные перевозки и транспортные услуги.
+
+    Проверяется только открытое название/описание карточки. Документация в
+    этот фильтр не попадает: её чтение отключено, чтобы не тратить время на
+    скачивание вложений.
+    """
+    text = _normalize_document_text(f"{t.title} {t.procedure}").casefold()
+    if not text:
         return False
-    if EXCLUDE_RE.search(text):
+    if _compile_exclude_pattern(exclude_keywords).search(text):
         return False
-    # Одни названия модели/типа могут не содержать слова «автомобиль»:
-    # например, «УАЗ Патриот», «ПАЗ-3205», «трал» или «полуприцеп».
-    return bool(ROAD_RE.search(text)) or bool(extract_transport_name(text))
+    # Заправка, шиномонтаж и замена масла — услуги вокруг автомобиля, но не
+    # перевозка. Исключение не действует, если та же закупка явно описывает
+    # перевозку топлива/шин/груза.
+    if NON_TRANSPORT_SERVICE_RE.search(text) and not TRANSPORT_ACTION_RE.search(text):
+        return False
+
+    has_transport = bool(TRANSPORT_SIGNAL_RE.search(text))
+    # Название может состоять из одной узнаваемой модели: «аренда УАЗ
+    # Патриот с водителем». Модель считается транспортным сигналом только
+    # вместе с признаком услуги ниже.
+    if not has_transport:
+        has_transport = bool(extract_transport_name(text))
+    if not has_transport or not SERVICE_SIGNAL_RE.search(text):
+        return False
+
+    # Поставка/покупка самого автомобиля или техники — это товарная закупка,
+    # а не перевозка. Оставляем редкий вариант «поставка услуг по перевозке».
+    if SUPPLY_RE.search(text):
+        # Даже если в названии написано «для оказания услуг», закупка
+        # автомобиля/техники остаётся товарной и не должна проходить фильтр.
+        if SUPPLY_VEHICLE_RE.search(text):
+            return False
+        service_phrase = re.search(
+            r"(?:услуг\w*|оказан\w*|предоставлен\w*).{0,60}"
+            r"(?:перевоз\w*|транспортир\w*|достав\w*|аренд\w*|экспедиц\w*|фрахт\w*)|"
+            r"(?:перевоз\w*|транспортир\w*|достав\w*|аренд\w*|экспедиц\w*|фрахт\w*).{0,60}"
+            r"(?:услуг\w*|оказан\w*|предоставлен\w*)",
+            text,
+            re.I | re.S,
+        )
+        if not service_phrase:
+            return False
+    return True
 
 
 def parse_ddmmyyyy(s: str) -> datetime | None:
@@ -1648,11 +1853,13 @@ def parse_code_list(value: str) -> list[str]:
 def collect_eis(date_from: str, date_to: str, region_name: str, customer_filter: str,
                 keywords: list[str], active_only: bool, enrich: bool,
                 progress: Callable[[str], None], stop_event: threading.Event,
-                insecure: bool = False, okpd_codes: list[str] | None = None) -> list[Tender]:
+                insecure: bool = False, okpd_codes: list[str] | None = None,
+                exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None) -> list[Tender]:
     dl = Downloader(insecure=insecure)
     region_code = REGIONS.get(region_name, "")
     unique: dict[str, Tender] = {}
     okpd_codes = okpd_codes or []
+    exclude_pattern = _compile_exclude_pattern(exclude_keywords)
     search_terms = keywords + okpd_codes
     for ki, keyword in enumerate(search_terms, 1):
         if stop_event.is_set():
@@ -1670,7 +1877,7 @@ def collect_eis(date_from: str, date_to: str, region_name: str, customer_filter:
                 if not t.number:
                     continue
                 is_code_search = keyword in okpd_codes
-                if not matches_road_transport(t) and not is_code_search:
+                if not matches_road_transport(t, exclude_pattern) and not is_code_search:
                     continue
                 if is_code_search:
                     t.okpd2 = f"{keyword} — {OKPD2_CODES.get(keyword, '')}".rstrip(" —")
@@ -1690,23 +1897,21 @@ def collect_eis(date_from: str, date_to: str, region_name: str, customer_filter:
             progress(f"ЕИС, {keyword}: страница {page}, новых {added}, всего {len(unique)}")
             if len(rows) < 190:
                 break
-            time.sleep(0.35)
+            time.sleep(0.1)
     eis_rows = list(unique.values())
     if enrich and eis_rows:
         for i, t in enumerate(eis_rows, 1):
             if stop_event.is_set():
                 break
-            progress(f"ЕИС: карточка и документация {i}/{len(eis_rows)} — № {t.number}")
+            progress(f"ЕИС: уточнение карточки {i}/{len(eis_rows)} — № {t.number}")
             try:
                 enrich_from_detail(
                     t,
                     dl.get(t.eis_url),
-                    document_loader=lambda url, referer=t.eis_url: dl.get_document(url, referer),
                     progress=progress,
                 )
             except Exception as exc:
                 progress(f"Предупреждение ЕИС № {t.number}: {exc}")
-            time.sleep(0.3)
     return eis_rows
 
 
@@ -1717,10 +1922,12 @@ def collect_tenders(date_from: str, date_to: str, region_name: str, customer_fil
                     include_market: bool = True, include_rosneft: bool = True,
                     include_rosnefttkp: bool = True,
                     okved_codes: list[str] | None = None,
-                    okpd_codes: list[str] | None = None) -> list[Tender]:
+                    okpd_codes: list[str] | None = None,
+                    exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None) -> list[Tender]:
     # Поиск по классификаторам отключен по требованию пользователя.
     okved_codes = []
     okpd_codes = []
+    exclude_keywords = exclude_keywords if exclude_keywords is not None else DEFAULT_EXCLUDE_KEYWORDS
     all_rows: list[Tender] = []
     errors: list[str] = []
     successful_sources = 0
@@ -1729,7 +1936,8 @@ def collect_tenders(date_from: str, date_to: str, region_name: str, customer_fil
         try:
             all_rows.extend(collect_eis(
                 date_from, date_to, region_name, customer_filter, keywords,
-                active_only, enrich, progress, stop_event, insecure, okpd_codes
+                active_only, enrich, progress, stop_event, insecure, okpd_codes,
+                exclude_keywords
             ))
             successful_sources += 1
         except Exception as exc:
@@ -1749,7 +1957,8 @@ def collect_tenders(date_from: str, date_to: str, region_name: str, customer_fil
         try:
             all_rows.extend(collect_tektorg(
                 date_from, date_to, region_name, customer_filter, keywords,
-                active_only, sections, progress, stop_event, okved_codes, okpd_codes
+                active_only, sections, progress, stop_event, okved_codes, okpd_codes,
+                enrich, exclude_keywords
             ))
             successful_sources += 1
         except Exception as exc:
@@ -1779,7 +1988,7 @@ def export_xlsx(rows: list[Tender], path: str, params: dict):
     ws = wb.active
     ws.title = "Актуальные закупки"
     headers = ["№", "Номер закупки", "Объект закупки", "Транспорт (марка/модель)",
-               "Документация транспорта", "НМЦК, руб.", "Дата публикации", "Окончание подачи",
+               "Документация транспорта (не сканируется)", "НМЦК, руб.", "Дата публикации", "Окончание подачи",
                "Регион", "Заказчик", "Закон", "Статус", "Способ закупки",
                "Электронная площадка", "Ссылка на ЭТП", "Ссылка на ЕИС", "Найдено по запросу"]
     ws.append(headers)
@@ -2179,7 +2388,10 @@ class App(tk.Tk):
         self.region = tk.StringVar(value="Все регионы")
         self.customer = tk.StringVar()
         self.active = tk.BooleanVar(value=True)
-        self.enrich = tk.BooleanVar(value=True)
+        # Быстрый режим по умолчанию: запросы и карточки, без скачивания
+        # вложений. При необходимости пользователь может отдельно включить
+        # уточнение данных из HTML карточки.
+        self.enrich = tk.BooleanVar(value=False)
         self.insecure = tk.BooleanVar(value=False)
         self.include_eis = tk.BooleanVar(value=True)
         self.include_market = tk.BooleanVar(value=True)
@@ -2223,24 +2435,51 @@ class App(tk.Tk):
         ttk.Button(kw_frame, text="Сбросить к значениям по умолчанию", style="Link.TButton",
                    command=self._reset_keywords).pack(anchor="e", pady=(6, 0))
 
+        exclude_frame = ttk.LabelFrame(
+            parent,
+            text="Слова исключения (не искать ремонт, мойку и товарные закупки)",
+            style="Card.TLabelframe",
+            padding=12,
+        )
+        exclude_frame.pack(fill="x", pady=(12, 0))
+        self.exclude_keywords = tk.Text(
+            exclude_frame, height=4, wrap="word", font=("Segoe UI", 9),
+            bg="#ffffff", fg=self.TEXT, insertbackground=self.TEXT, relief="flat",
+            highlightthickness=1, highlightbackground=self.BORDER, highlightcolor=self.ACCENT,
+            padx=8, pady=6,
+        )
+        self.exclude_keywords.pack(fill="x")
+        self.exclude_keywords.insert("1.0", "\n".join(DEFAULT_EXCLUDE_KEYWORDS))
+        ttk.Button(exclude_frame, text="Сбросить исключения", style="Link.TButton",
+                   command=self._reset_exclude_keywords).pack(anchor="e", pady=(6, 0))
+        ttk.Label(
+            exclude_frame,
+            text="Исключения проверяются по названию и описанию карточки. Файлы документации не скачиваются.",
+            style="CardMuted.TLabel", wraplength=980,
+        ).pack(anchor="w", pady=(2, 0))
+
         opts = ttk.LabelFrame(parent, text="Дополнительные параметры", style="Card.TLabelframe", padding=12)
         opts.pack(fill="x", pady=(12, 0))
         opts_row = ttk.Frame(opts, style="Card.TFrame")
         opts_row.pack(fill="x")
         ttk.Checkbutton(opts_row, text="Только этап «Подача заявок»", variable=self.active).pack(side="left")
-        ttk.Checkbutton(opts_row, text="Искать транспорт в карточке и документации (медленнее)",
+        ttk.Checkbutton(opts_row, text="Уточнять транспорт и данные в карточке (медленнее)",
                          variable=self.enrich).pack(side="left", padx=18)
         ttk.Checkbutton(opts_row, text="Игнорировать проверку сертификата TLS", variable=self.insecure).pack(
             side="left")
         ttk.Label(
             opts,
-            text="Поиск транспорта в документации даёт более точный результат, но заметно увеличивает время поиска.",
+            text="Быстрый режим не скачивает вложения. При включении уточнения читается только HTML карточки, без поиска по файлам документации.",
             style="CardMuted.TLabel", wraplength=980,
         ).pack(anchor="w", pady=(8, 0))
 
     def _reset_keywords(self):
         self.keywords.delete("1.0", "end")
         self.keywords.insert("1.0", "\n".join(DEFAULT_KEYWORDS))
+
+    def _reset_exclude_keywords(self):
+        self.exclude_keywords.delete("1.0", "end")
+        self.exclude_keywords.insert("1.0", "\n".join(DEFAULT_EXCLUDE_KEYWORDS))
 
     def _build_results_tab(self, parent):
         toolbar = ttk.Frame(parent)
@@ -2454,6 +2693,17 @@ class App(tk.Tk):
                 result.append(kw)
         return result
 
+    def _get_exclude_keywords(self) -> list[str]:
+        """Возвращает локальные слова исключения из отдельного поля."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for line in self.exclude_keywords.get("1.0", "end").splitlines():
+            word = line.strip()
+            if word and word.casefold() not in seen:
+                seen.add(word.casefold())
+                result.append(word)
+        return result
+
     def validate(self) -> bool:
         for value in (self.date_from.get(), self.date_to.get()):
             if not parse_ddmmyyyy(value):
@@ -2484,10 +2734,11 @@ class App(tk.Tk):
         self.notebook.select(0)
         self._set_status("running", "Выполняется поиск…")
         kws = self._get_keywords()
+        exclusions = self._get_exclude_keywords()
         args = (self.date_from.get(), self.date_to.get(), self.region.get(), self.customer.get().strip(),
                 kws, self.active.get(), self.enrich.get(), self.add_log, self.stop_event, self.insecure.get(),
                 self.include_eis.get(), self.include_market.get(), self.include_rosneft.get(),
-                self.include_rosnefttkp.get(), [], [])
+                self.include_rosnefttkp.get(), [], [], exclusions)
         threading.Thread(target=self._worker, args=args, daemon=True).start()
 
     def _worker(self, *args):
@@ -2534,7 +2785,8 @@ class App(tk.Tk):
             "Фильтр по заказчику": self.customer.get() or "не задан",
             "Только подача заявок": "да" if self.active.get() else "нет",
             "Поисковые фразы": "; ".join(keywords),
-            "Режим поиска": "только по ключевым словам; поиск по ОКВЭД2 и ОКПД2 отключен",
+            "Слова исключения": "; ".join(self._get_exclude_keywords()),
+            "Режим поиска": "только по ключевым словам; вложения не сканируются; поиск по ОКВЭД2 и ОКПД2 отключен",
             "Источники": "; ".join([
                 name for enabled, name in [
                     (self.include_eis.get(), "ЕИС 44/223-ФЗ"),
