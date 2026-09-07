@@ -2214,13 +2214,26 @@ class App(tk.Tk):
         self._last_export_path: str | None = None
         self._build_ui()
         self._set_status("idle", "Готово к работе")
-        self.minsize(1000, 680)
+        # Минимальный размер намеренно небольшой: содержимое вкладки «Поиск»
+        # прокручивается, а кнопки внизу видны при любой высоте окна.
+        self.minsize(900, 520)
         self._center_window(1120, 760)
 
     def _center_window(self, width: int, height: int):
+        """Центрирует окно, не позволяя ему выйти за пределы экрана.
+
+        На ноутбуках с невысоким экраном (1366x768 и меньше) окно 1120x760
+        не помещалось целиком вместе с панелью задач, из-за чего нижняя
+        полоса с кнопкой запуска оказывалась за границей экрана.
+        """
         self.update_idletasks()
-        x = max(0, (self.winfo_screenwidth() - width) // 2)
-        y = max(0, (self.winfo_screenheight() - height) // 2)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        # Оставляем запас под панель задач и заголовок окна.
+        width = max(800, min(width, screen_w - 40))
+        height = max(500, min(height, screen_h - 100))
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 3)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
     # ------------------------------------------------------------------
@@ -2323,21 +2336,93 @@ class App(tk.Tk):
 
         self._build_header(root)
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, pady=(12, 12))
+        # Важно: панель действий пакуется ДО блокнота и прижимается к низу.
+        # Так менеджер pack сначала резервирует место под кнопки «Найти» /
+        # «Остановить» / «Выгрузить», а уже остаток отдаёт вкладкам. При
+        # нехватке высоты экрана сжимается содержимое вкладок (у него есть
+        # собственная прокрутка), а кнопки внизу остаются видимыми всегда.
+        self._build_action_bar(root)
 
-        search_tab = ttk.Frame(self.notebook, padding=12)
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(side="top", fill="both", expand=True, pady=(12, 12))
+
+        search_tab = ttk.Frame(self.notebook)
         results_tab = ttk.Frame(self.notebook, padding=12)
         log_tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(search_tab, text="Поиск")
         self.notebook.add(results_tab, text="Результаты")
         self.notebook.add(log_tab, text="Журнал")
 
-        self._build_search_tab(search_tab)
+        # Вкладка «Поиск» самая высокая, поэтому её содержимое размещаем в
+        # прокручиваемой области — на низких экранах ничего не «уезжает».
+        self._build_search_tab(self._make_scrollable(search_tab))
         self._build_results_tab(results_tab)
         self._build_log_tab(log_tab)
 
-        self._build_action_bar(root)
+    def _make_scrollable(self, parent) -> ttk.Frame:
+        """Оборачивает содержимое во фрейм с вертикальной прокруткой.
+
+        Возвращает внутренний фрейм, в который нужно складывать виджеты.
+        Полоса прокрутки появляется только тогда, когда содержимое реально
+        не помещается по высоте.
+        """
+        canvas = tk.Canvas(parent, bg=self.BG, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        inner = ttk.Frame(canvas, padding=12)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window, width=canvas.winfo_width())
+            need = inner.winfo_reqheight() > canvas.winfo_height()
+            if need and not vsb.winfo_ismapped():
+                vsb.grid(row=0, column=1, sticky="ns")
+            elif not need and vsb.winfo_ismapped():
+                vsb.grid_remove()
+                canvas.yview_moveto(0)
+
+        inner.bind("<Configure>", _sync)
+        canvas.bind("<Configure>", _sync)
+
+        def _on_wheel(event):
+            if not vsb.winfo_ismapped():
+                return
+            # Внутри текстовых полей колесо должно прокручивать их самих.
+            if isinstance(getattr(event, "widget", None), (tk.Text, tk.Listbox)):
+                return
+            if getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            else:
+                delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta, "units")
+
+        for widget, seq in ((canvas, "<MouseWheel>"), (canvas, "<Button-4>"), (canvas, "<Button-5>")):
+            widget.bind(seq, _on_wheel)
+        # Колесо мыши должно работать и над вложенными виджетами.
+        inner.bind_all("<MouseWheel>", lambda e: _on_wheel(e) if self._widget_in(e.widget, canvas) else None,
+                       add="+")
+        inner.bind_all("<Button-4>", lambda e: _on_wheel(e) if self._widget_in(e.widget, canvas) else None,
+                       add="+")
+        inner.bind_all("<Button-5>", lambda e: _on_wheel(e) if self._widget_in(e.widget, canvas) else None,
+                       add="+")
+        return inner
+
+    @staticmethod
+    def _widget_in(widget, container) -> bool:
+        """True, если widget находится внутри container (или им является)."""
+        while widget is not None:
+            if widget is container:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
 
     def _build_menu(self):
         menubar = tk.Menu(self)
@@ -2543,8 +2628,10 @@ class App(tk.Tk):
         self.log.tag_configure("error", foreground=self.ERROR)
 
     def _build_action_bar(self, parent):
+        # side="bottom" — панель гарантированно занимает своё место у нижнего
+        # края окна и не может быть вытеснена растущим блокнотом.
         bar = ttk.Frame(parent)
-        bar.pack(fill="x")
+        bar.pack(side="bottom", fill="x")
         buttons = ttk.Frame(bar)
         buttons.pack(fill="x")
         self.run_btn = ttk.Button(buttons, text="▶  Найти закупки", style="Accent.TButton", command=self.start)
