@@ -26,8 +26,8 @@ from typing import Callable
 from urllib.parse import urlencode, urljoin, urlparse, parse_qs, unquote
 import xml.etree.ElementTree as ET
 
-APP_NAME = "Транспортные закупки — ЕИС и ТЭК-Торг"
-APP_VERSION = "1.15.0"
+APP_NAME = "Транспортные закупки — ЕИС, ТЭК-Торг и ЭТП ГПБ"
+APP_VERSION = "1.16.0"
 MIN_PYTHON = (3, 10)  # playwright поддерживает только Python 3.10 и новее
 
 
@@ -245,6 +245,15 @@ GENERIC_VEHICLE_RE = re.compile(
     re.I,
 )
 RSS_URL = EIS + "/epz/order/extendedsearch/rss.html"
+
+# ЭТП ГПБ (etpgpb.ru): открытый поиск по торгам и официальный RSS-канал с теми
+# же фильтрами, что и страница поиска (описание интеграции — https://etpgpb.ru/api/).
+# Канал отдаёт актуальные процедуры секций 223-ФЗ, коммерческих закупок и
+# закупок ГК «Газпром»; антибот-обход, как для ТЭК-Торг, не требуется.
+ETPGPB = "https://etpgpb.ru"
+ETPGPB_NAME = "ЭТП ГПБ"
+ETPGPB_RSS_URL = ETPGPB + "/procedures.rss"
+ETPGPB_SEARCH_URL = ETPGPB + "/procedures"
 
 # Короткий набор именно поисковых фраз. В старой версии сюда входили
 # отдельные марки, модели и типы техники. Они давали много лишних запросов
@@ -1906,6 +1915,236 @@ def collect_tektorg(date_from: str, date_to: str, region_name: str, customer_fil
         browser.close()
 
 
+def _split_etpgpb_title(title: str) -> tuple[str, str, float | None]:
+    """Разбирает заголовок записи RSS ЭТП ГПБ «номер название - заказчик - ценаRUB».
+
+    Номер закупки и название разделены одним пробелом, а дефисы внутри
+    названия — обычное дело, поэтому заказчик и цена берутся с конца строки.
+    Если хвост не похож на цену, считается, что площадка изменила формат,
+    и весь заголовок остаётся названием.
+    """
+    name = clean_text(title)
+    parts = re.split(r"\s+-\s+", name)
+    if len(parts) >= 3:
+        tail = parts[-1]
+        if re.search(r"\d", tail) or re.match(r"цена", tail, re.I):
+            return " - ".join(parts[:-2]), parts[-2], parse_price(tail)
+    return name, "", None
+
+
+def _etpgpb_number(name: str, link: str) -> str:
+    """Номер процедуры ЭТП ГПБ: торговый номер, номер ЕИС или внутренний ID ссылки.
+
+    Первый токен названия считается номером, только если он похож на код
+    (STG23003177, 0866300010823000021): буквы/цифры без строчных букв и не
+    менее шести цифр — так «KAMAZ-6520» в начале названия модели не
+    принимается за номер закупки.
+    """
+    first = name.split(" ", 1)[0] if name else ""
+    if 5 <= len(first) <= 25 and re.fullmatch(r"[0-9A-ZА-ЯЁ][0-9A-ZА-ЯЁ\-]*", first) \
+            and len(re.findall(r"\d", first)) >= 6:
+        return first
+    return get_reg_number(link, name) or _etpgpb_id_from_link(link)
+
+
+def _etpgpb_id_from_link(link: str) -> str:
+    """Внутренний номер из ссылки карточки: /489853-slug/ или UUID (gos.etpgpb.ru)."""
+    parts = [p for p in urlparse(link).path.split("/") if p]
+    if not parts:
+        return ""
+    tail = parts[-1]
+    if re.fullmatch(r"[0-9a-fA-F\-]{16,}", tail):
+        return tail
+    m = re.match(r"(\d{3,})", tail)
+    return m.group(1) if m else ""
+
+
+def _etpgpb_law(link: str) -> str:
+    """Определяет секцию закупки ЭТП ГПБ по адресу карточки."""
+    parsed = urlparse(link)
+    path = parsed.path.lower()
+    if "gos.etpgpb.ru" in parsed.netloc.lower() or "/etp/" in path:
+        return "44-ФЗ"
+    if "/gaz/" in path:
+        return "Закупки ГК «Газпром»"
+    return "223-ФЗ / коммерческая закупка"
+
+
+def _etpgpb_procedure(link: str) -> str:
+    """Способ закупки по адресу карточки (пока распознаётся только ценовой запрос)."""
+    if "/price_request/" in urlparse(link).path.lower():
+        return "Ценовой запрос"
+    return ""
+
+
+def parse_etpgpb_rss(xml_bytes: bytes, keyword: str) -> list[Tender]:
+    """Разбирает RSS-канал поиска по торгам ЭТП ГПБ (https://etpgpb.ru/procedures.rss).
+
+    Каждый <item> содержит только заголовок, ссылку и дату публикации — номер,
+    название, заказчик и цена закодированы в заголовке. Разбор устойчив к
+    изменениям формата: нераспознанные поля остаются пустыми, записи не
+    теряются.
+    """
+    root = ET.fromstring(xml_bytes)
+    rows: list[Tender] = []
+    for item in root.findall(".//item"):
+        title_raw = clean_text(item.findtext("title", ""))
+        link = clean_text(item.findtext("link", ""))
+        if not link or not title_raw:
+            continue
+        name, customer, price = _split_etpgpb_title(title_raw)
+        number = _etpgpb_number(name, link)
+        # Торговый номер в начале заголовка не часть названия закупки.
+        if number and name.startswith(number):
+            name = name[len(number):].lstrip(" .:;-–—")
+        published = ""
+        try:
+            published = parsedate_to_datetime(item.findtext("pubDate", "")).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            pass
+        rows.append(Tender(
+            number=number, title=name,
+            transport=extract_transport_name(name), nmck=price,
+            published=published, customer=customer,
+            law=_etpgpb_law(link), status="",
+            procedure=_etpgpb_procedure(link), etp=ETPGPB_NAME, etp_url=link,
+            matched_keyword=keyword,
+        ))
+    return rows
+
+
+def build_etpgpb_rss_url(keyword: str, page: int) -> str:
+    """RSS тех же фильтров, что и страница «Поиск по торгам» ЭТП ГПБ.
+
+    procedure[category]=actual — только актуальные процедуры, search —
+    поисковая фраза (официальное описание канала: https://etpgpb.ru/api/).
+    """
+    params = {"procedure[category]": "actual", "search": keyword, "sort": "by_published_desc"}
+    if page > 1:
+        params["page"] = str(page)
+    return ETPGPB_RSS_URL + "?" + urlencode(params)
+
+
+def enrich_etpgpb_detail(t: Tender, page: bytes):
+    """Дополняет запись ЭТП ГПБ данными открытой HTML-карточки.
+
+    RSS не содержит срок подачи заявок и регион — они берутся из карточки.
+    Вложения не скачиваются: название транспорта ищется в тексте карточки.
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    page_text = _normalize_document_text(soup.get_text(" ", strip=True))
+    if not t.deadline:
+        m = re.search(
+            r"(?:Подача заявок до|окончани[ея] (?:срока )?подачи заявок|Приём заявок до)\s*:?\s*"
+            r"(\d{2}\.\d{2}\.\d{4}(?:,?\s*\d{1,2}:\d{2})?)",
+            page_text, re.I,
+        )
+        if m:
+            t.deadline = normalize_date(m.group(1))
+    if not t.region:
+        region = nearby_value(soup, ["Регионы", "Регион"])
+        if region and len(region) < 250:
+            t.region = region
+    if not t.customer:
+        customer = nearby_value(soup, ["Заказчик", "Заказчики", "Организатор"])
+        if customer and len(customer) < 400:
+            t.customer = customer
+    if not t.procedure:
+        procedure = nearby_value(soup, ["Тип процедуры", "Способ закупки", "Тип"])
+        if procedure and len(procedure) < 250:
+            t.procedure = procedure
+    card_transport = extract_transport_name(page_text)
+    if card_transport:
+        t.transport = _merge_transport_values(t.transport, card_transport)
+    return t
+
+
+def collect_etpgpb(date_from: str, date_to: str, region_name: str, customer_filter: str,
+                   keywords: list[str], active_only: bool, progress: Callable[[str], None],
+                   stop_event: threading.Event, enrich: bool = False,
+                   exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None,
+                   insecure: bool = False) -> list[Tender]:
+    """Собирает закупки на ЭТП ГПБ (etpgpb.ru) через официальный RSS-канал.
+
+    Площадка публикует открытый RSS по любым фильтрам страницы «Поиск по
+    торгам», поэтому отдельный браузер, как для ТЭК-Торг, не нужен. Канал
+    возвращает только актуальные процедуры (procedure[category]=actual),
+    поэтому флажок «Только этап "Подача заявок"» выполняется самой площадкой.
+    Регион в RSS отсутствует: при выбранном регионе (или включённом уточнении)
+    карточки открываются в обычном HTTP-режиме, без загрузки вложений.
+    """
+    dl = Downloader(insecure=insecure)
+    unique: dict[str, Tender] = {}
+    exclude_pattern = _compile_exclude_pattern(exclude_keywords)
+    d1, d2 = parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)
+    for ki, keyword in enumerate(keywords, 1):
+        if stop_event.is_set():
+            break
+        progress(f"ЭТП ГПБ, запрос {ki}/{len(keywords)}: {keyword}")
+        page_signatures: set[tuple[str, ...]] = set()
+        seen_links: set[str] = set()
+        for page in range(1, 6):
+            if stop_event.is_set():
+                break
+            url = build_etpgpb_rss_url(keyword, page)
+            try:
+                rows = parse_etpgpb_rss(dl.get(url), keyword)
+            except Exception as exc:
+                # Ошибка одного запроса не должна обнулять уже собранные закупки.
+                progress(f"ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ, «{keyword}»: {exc}")
+                break
+            if not rows:
+                progress(f"ЭТП ГПБ: по запросу «{keyword}» записи не получены")
+                break
+            signature = tuple(t.etp_url for t in rows)
+            if signature in page_signatures:
+                # Площадка проигнорировала номер страницы — записи начали повторяться.
+                progress("ЭТП ГПБ: страница повторилась, переход к следующему запросу")
+                break
+            page_signatures.add(signature)
+            added = 0
+            for t in rows:
+                if t.etp_url in seen_links:
+                    continue
+                seen_links.add(t.etp_url)
+                pub = parse_ddmmyyyy(t.published)
+                if pub and ((d1 and pub < d1) or (d2 and pub > d2)):
+                    continue
+                if not matches_road_transport(t, exclude_pattern):
+                    continue
+                if customer_filter and customer_filter.lower() not in t.customer.lower():
+                    continue
+                key = "etpgpb:" + (t.number or t.etp_url)
+                existing = unique.get(key)
+                if existing:
+                    if t.matched_keyword and t.matched_keyword not in existing.matched_keyword:
+                        existing.matched_keyword = "; ".join(x for x in
+                                                             (existing.matched_keyword, t.matched_keyword) if x)
+                else:
+                    unique[key] = t
+                    added += 1
+            progress(f"ЭТП ГПБ, «{keyword}»: страница {page}, новых подходящих {added}, всего {len(unique)}")
+            time.sleep(0.1)
+    items = list(unique.values())
+    # Срок подачи и регион в RSS отсутствуют — при необходимости открываем
+    # HTML-карточку (обычный запрос без вложений, как у ТЭК-Торг).
+    if (enrich or region_name != "Все регионы") and items:
+        for i, t in enumerate(items, 1):
+            if stop_event.is_set():
+                break
+            progress(f"ЭТП ГПБ: уточнение карточки {i}/{len(items)} — № {t.number}")
+            try:
+                enrich_etpgpb_detail(t, dl.get(t.etp_url))
+            except Exception as exc:
+                progress(f"Предупреждение ЭТП ГПБ № {t.number}: {exc}")
+    # Регион проверяется после детализации: площадка может не указать его —
+    # такая запись сохраняется (тот же подход, что у ТЭК-Торг).
+    if region_name != "Все регионы":
+        target = region_name.lower().replace(" — ", " ")
+        items = [t for t in items if not t.region or target.split()[0] in t.region.lower()]
+    return items
+
+
 def build_rss_url(keyword: str, date_from: str, date_to: str, region_code: str, page: int, active_only: bool) -> str:
     params = {
         "searchString": keyword, "morphology": "on", "search-filter": "Дате размещения",
@@ -2061,7 +2300,7 @@ def collect_tenders(date_from: str, date_to: str, region_name: str, customer_fil
                     progress: Callable[[str], None], stop_event: threading.Event,
                     insecure: bool = False, include_eis: bool = True,
                     include_market: bool = True, include_rosneft: bool = True,
-                    include_rosnefttkp: bool = True,
+                    include_rosnefttkp: bool = True, include_etpgpb: bool = True,
                     okved_codes: list[str] | None = None,
                     okpd_codes: list[str] | None = None,
                     exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None) -> list[Tender]:
@@ -2104,6 +2343,18 @@ def collect_tenders(date_from: str, date_to: str, region_name: str, customer_fil
             successful_sources += 1
         except Exception as exc:
             msg = "ТЭК-Торг недоступен: " + str(exc)
+            errors.append(msg)
+            progress("ПРЕДУПРЕЖДЕНИЕ: " + msg)
+
+    if include_etpgpb and not stop_event.is_set():
+        try:
+            all_rows.extend(collect_etpgpb(
+                date_from, date_to, region_name, customer_filter, keywords,
+                active_only, progress, stop_event, enrich, exclude_keywords, insecure
+            ))
+            successful_sources += 1
+        except Exception as exc:
+            msg = "ЭТП ГПБ недоступна: " + str(exc)
             errors.append(msg)
             progress("ПРЕДУПРЕЖДЕНИЕ: " + msg)
 
@@ -2578,6 +2829,8 @@ class App(tk.Tk):
                                 command=lambda: webbrowser.open(EIS + "/epz/order/extendedsearch/results.html"))
         sites_menu.add_command(label="Открыть ТЭК-Торг",
                                 command=lambda: webbrowser.open("https://www.tektorg.ru/market/procedures"))
+        sites_menu.add_command(label="Открыть ЭТП ГПБ",
+                                command=lambda: webbrowser.open(ETPGPB_SEARCH_URL + "/"))
         menubar.add_cascade(label="Площадки", menu=sites_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -2597,7 +2850,7 @@ class App(tk.Tk):
             # Старые сборки Tcl/Tk (< 8.6.10, Python 3.8) не принимают символы вне BMP.
             title_label.configure(text="Мониторинг закупок автомобильных перевозок")
         title_label.pack(anchor="w")
-        ttk.Label(title_box, text="ЕИС 44/223-ФЗ • ТЭК-Торг: КИМ, Роснефть, запросы (Т)КП • выгрузка в Excel",
+        ttk.Label(title_box, text="ЕИС 44/223-ФЗ • ТЭК-Торг: КИМ, Роснефть, запросы (Т)КП • ЭТП ГПБ • выгрузка в Excel",
                   style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
         links = ttk.Frame(header)
         links.pack(side="right", anchor="n")
@@ -2606,6 +2859,8 @@ class App(tk.Tk):
         ttk.Button(links, text="ТЭК-Торг ↗", style="Link.TButton",
                    command=lambda: webbrowser.open("https://www.tektorg.ru/market/procedures")).pack(
             side="right", padx=(0, 6))
+        ttk.Button(links, text="ЭТП ГПБ ↗", style="Link.TButton",
+                   command=lambda: webbrowser.open(ETPGPB_SEARCH_URL + "/")).pack(side="right", padx=(0, 6))
 
     def _build_search_tab(self, parent):
         today = datetime.now()
@@ -2623,6 +2878,7 @@ class App(tk.Tk):
         self.include_market = tk.BooleanVar(value=True)
         self.include_rosneft = tk.BooleanVar(value=True)
         self.include_rosnefttkp = tk.BooleanVar(value=True)
+        self.include_etpgpb = tk.BooleanVar(value=True)
 
         form = ttk.LabelFrame(parent, text="Период, регион и заказчик", style="Card.TLabelframe", padding=14)
         form.pack(fill="x")
@@ -2646,6 +2902,7 @@ class App(tk.Tk):
         ttk.Checkbutton(sources, text="ТЭК-Торг — Роснефть", variable=self.include_rosneft).pack(side="left")
         ttk.Checkbutton(sources, text="Роснефть — запросы (Т)КП", variable=self.include_rosnefttkp).pack(
             side="left", padx=14)
+        ttk.Checkbutton(sources, text="ЭТП ГПБ (etpgpb.ru)", variable=self.include_etpgpb).pack(side="left")
 
         kw_frame = ttk.LabelFrame(parent, text="Поиск по ключевым словам (по одному запросу в строке)",
                                    style="Card.TLabelframe", padding=12)
@@ -2834,8 +3091,9 @@ class App(tk.Tk):
         messagebox.showinfo(
             "О программе",
             f"{APP_NAME}\nВерсия {APP_VERSION}\n\n"
-            "Мониторинг открытых закупок автомобильных перевозок в ЕИС и ТЭК-Торг "
-            "с автоматическим извлечением марки/модели транспорта и выгрузкой в Excel.\n\n"
+            "Мониторинг открытых закупок автомобильных перевозок в ЕИС, ТЭК-Торг "
+            "и на ЭТП ГПБ (etpgpb.ru) с автоматическим извлечением марки/модели "
+            "транспорта и выгрузкой в Excel.\n\n"
             "Перед подачей заявки всегда проверяйте актуальную карточку закупки на площадке.",
         )
 
@@ -2944,7 +3202,8 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", "Укажите хотя бы одну поисковую фразу")
             return False
         if not any((self.include_eis.get(), self.include_market.get(),
-                    self.include_rosneft.get(), self.include_rosnefttkp.get())):
+                    self.include_rosneft.get(), self.include_rosnefttkp.get(),
+                    self.include_etpgpb.get())):
             messagebox.showerror("Ошибка", "Выберите хотя бы один источник")
             return False
         return True
@@ -2966,7 +3225,7 @@ class App(tk.Tk):
         args = (self.date_from.get(), self.date_to.get(), self.region.get(), self.customer.get().strip(),
                 kws, self.active.get(), self.enrich.get(), self.add_log, self.stop_event, self.insecure.get(),
                 self.include_eis.get(), self.include_market.get(), self.include_rosneft.get(),
-                self.include_rosnefttkp.get(), [], [], exclusions)
+                self.include_rosnefttkp.get(), self.include_etpgpb.get(), [], [], exclusions)
         threading.Thread(target=self._worker, args=args, daemon=True).start()
 
     def _worker(self, *args):
@@ -2984,7 +3243,8 @@ class App(tk.Tk):
             self.after(0, lambda msg=message: messagebox.showerror(
                 "Ошибка получения данных",
                 msg + "\n\nПроверьте Интернет. Для ЕИС можно временно включить флажок TLS; "
-                      "для ТЭК-Торг пройдите проверку в окне Яндекс Браузера. См. README.",
+                      "для ТЭК-Торг пройдите проверку в окне Яндекс Браузера; "
+                      "для ЭТП ГПБ достаточно доступа к etpgpb.ru. См. README.",
             ))
         finally:
             self.after(0, self._finish)
@@ -3021,6 +3281,7 @@ class App(tk.Tk):
                     (self.include_market.get(), "ТЭК-Торг КИМ"),
                     (self.include_rosneft.get(), "ТЭК-Торг Роснефть"),
                     (self.include_rosnefttkp.get(), "Роснефть запросы (Т)КП"),
+                    (self.include_etpgpb.get(), "ЭТП ГПБ"),
                 ] if enabled
             ]),
         }
