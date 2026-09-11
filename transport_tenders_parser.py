@@ -27,7 +27,7 @@ from urllib.parse import urlencode, urljoin, urlparse, parse_qs, unquote
 import xml.etree.ElementTree as ET
 
 APP_NAME = "Транспортные закупки — ЕИС, ТЭК-Торг и ЭТП ГПБ"
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 MIN_PYTHON = (3, 10)  # playwright поддерживает только Python 3.10 и новее
 
 
@@ -264,7 +264,7 @@ ETPGPB_SEARCH_URL = ETPGPB + ETPGPB_SEARCH_PATH
 # запоминается на весь запуск — по 60 фразам его заново ищут не будут.
 ETPGPB_HOSTS = (ETPGPB, "https://new.etpgpb.ru")
 ETPGPB_FEED_PATHS = (
-    "/procedures.rss", "/procedures/rss", "/api/procedures.rss", "/rss/procedures",
+    "/procedures.rss", "/procedures.rss/", "/procedures/rss", "/api/procedures.rss", "/rss/procedures",
 )
 # Сюда (рядом с программой) пользователь может вписать рабочий адрес канала,
 # если автоматический подбор не помог: одна строка, всё после «?» не нужно.
@@ -1143,7 +1143,7 @@ def _vehicle_model_after_brand(text: str, end: int) -> str:
     tail = re.sub(r"^\s*[|,:;\-–—/]\s*(?:марка|модель|тип)\s*[|,:;\-–—/]?\s*", " ", tail, flags=re.I)
     model = re.match(
         r"\s*(?:[-/|,:;]\s*)?(?:(?:Land\s+Cruiser(?:\s+\d{2,4})?)|"
-        r"(?:(?:Патриот|Patriot)(?:\s+(?:Профи|Profi))?)|"
+        r"(?:(?:Патриот|Patriot)(?:\s+(?:Профи|Pro\s+(?:Профи|Profi))?)|"
         r"(?:(?:Нива|Niva)(?:\s+(?:Travel|Тревел))?)|"
         r"(?:\d{2,5}(?:[-/]\w{1,12})*)|"
         r"(?:[A-ZА-ЯЁ]{1,6}\d{1,5}(?:[-/]\w{1,12})*)|"
@@ -2022,19 +2022,48 @@ def _etpgpb_procedure(link: str) -> str:
     return ""
 
 
+def _etpgpb_parse_pubdate(raw: str) -> str:
+    """Дата публикации записи канала: RFC-2822 (RSS) или ISO-8601 (Atom)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    try:
+        return parsedate_to_datetime(raw).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return ""
+
+
 def parse_etpgpb_rss(xml_bytes: bytes, keyword: str) -> list[Tender]:
     """Разбирает RSS-канал поиска по торгам ЭТП ГПБ (https://etpgpb.ru/procedures.rss).
 
     Каждый <item> содержит только заголовок, ссылку и дату публикации — номер,
     название, заказчик и цена закодированы в заголовке. Разбор устойчив к
     изменениям формата: нераспознанные поля остаются пустыми, записи не
-    теряются.
+    теряются. Понимается и Atom (<feed><entry>), чтобы переезд площадки на
+    другой формат канала не выглядел как «тендеры не найдены».
     """
-    root = ET.fromstring(xml_bytes)
+    root = ET.fromstring(xml_bytes.lstrip())
     rows: list[Tender] = []
-    for item in root.findall(".//item"):
-        title_raw = clean_text(item.findtext("title", ""))
-        link = clean_text(item.findtext("link", ""))
+    entries = root.findall(".//item") or root.findall(".//{http://www.w3.org/2005/Atom}entry")
+    for item in entries:
+        title_raw = clean_text(item.findtext("title", "") or "")
+        if not title_raw:
+            title_raw = clean_text(item.findtext("{http://www.w3.org/2005/Atom}title", "") or "")
+        if not title_raw:
+            # Название может уехать в description/summary.
+            title_raw = clean_text(item.findtext("description", "") or ""
+                                   or item.findtext("{http://www.w3.org/2005/Atom}summary", "") or "")
+        link = clean_text(item.findtext("link", "") or "")
+        if not link:
+            for tag in item.findall("{http://www.w3.org/2005/Atom}link"):
+                href = (tag.get("href") or "").strip()
+                if href:
+                    link = clean_text(href)
+                    break
         if not link or not title_raw:
             continue
         name, customer, price = _split_etpgpb_title(title_raw)
@@ -2042,11 +2071,11 @@ def parse_etpgpb_rss(xml_bytes: bytes, keyword: str) -> list[Tender]:
         # Торговый номер в начале заголовка не часть названия закупки.
         if number and name.startswith(number):
             name = name[len(number):].lstrip(" .:;-–—")
-        published = ""
-        try:
-            published = parsedate_to_datetime(item.findtext("pubDate", "")).strftime("%d.%m.%Y %H:%M")
-        except Exception:
-            pass
+        published = _etpgpb_parse_pubdate(
+            item.findtext("pubDate", "") or ""
+            or item.findtext("{http://www.w3.org/2005/Atom}published", "") or ""
+            or item.findtext("{http://www.w3.org/2005/Atom}updated", "") or ""
+        )
         rows.append(Tender(
             number=number, title=name,
             transport=extract_transport_name(name), nmck=price,
@@ -2061,14 +2090,71 @@ def parse_etpgpb_rss(xml_bytes: bytes, keyword: str) -> list[Tender]:
 def _etpgpb_feed_params(keyword: str, page: int) -> str:
     """Строка параметров RSS-запроса ЭТП ГПБ.
 
-    procedure[category]=actual — только актуальные процедуры, search —
-    поисковая фраза (официальное описание канала: https://etpgpb.ru/api/).
-    Скобки адресов фильтра площадка отдаёт в percent-encoding, его и держим.
+    procedure[category]=actual — только актуальные процедуры, поисковый
+    параметр — поисковая фраза (официальное описание канала:
+    https://etpgpb.ru/api/). Имя поискового параметра площадка может сменить:
+    если на странице «Поиск по торгам» найдено другое имя поля ввода
+    (_etpgpb_discover_search_param), используется оно. Скобки адресов фильтра
+    площадка отдаёт в percent-encoding, его и держим.
     """
-    params = {"procedure[category]": "actual", "search": keyword, "sort": "by_published_desc"}
+    search_param = str(_ETPGPB_FEED_CACHE.get("search_param") or "search")
+    params = {"procedure[category]": "actual", search_param: keyword, "sort": "by_published_desc"}
     if page > 1:
         params["page"] = str(page)
     return urlencode(params)
+
+
+def _etpgpb_search_input_name(page: str) -> str:
+    """Имя текстового поля поиска в HTML страницы «Поиск по торгам».
+
+    Возвращается только явное текстовое поле (type="text"/"search" или без
+    type), имя которого похоже на поиск. Скрытые и служебные поля не трогаем:
+    ошибочное имя уведет запросы не туда.
+    """
+    for m in re.finditer(r"<input\b[^>]*>", page, re.I):
+        tag = m.group(0)
+        type_m = re.search(r"""type\s*=\s*["']([a-z0-9_-]+)["']""", tag, re.I)
+        if type_m and type_m.group(1).lower() not in ("text", "search"):
+            continue
+        name_m = re.search(r"""name\s*=\s*["']([^"']+)["']""", tag, re.I)
+        if name_m and re.search(r"search|query|find|\bq\b|keyword|text", name_m.group(1), re.I):
+            return name_m.group(1)
+    return ""
+
+
+def _etpgpb_discover_search_param(dl: Downloader, progress: Callable[[str], None]) -> str:
+    """Узнаёт имя поискового параметра со страницы «Поиск по торгам».
+
+    Если у площадки поле поиска называется не «search», запросы с «search=…»
+    молча возвращают общий список без фильтра по фразе — выглядит это как
+    «поиск не находит тендеры». Имя поля читается из HTML формы и запоминается
+    на весь запуск.
+    """
+    cached = _ETPGPB_FEED_CACHE.get("search_param")
+    if cached:
+        return str(cached)
+    for host in ETPGPB_HOSTS:
+        try:
+            page = dl.get(host + ETPGPB_SEARCH_PATH).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not page:
+            continue
+        name = _etpgpb_search_input_name(page)
+        _ETPGPB_FEED_CACHE["search_param"] = name or "search"
+        if name and name != "search":
+            progress(f"ЭТП ГПБ: поисковый параметр на площадке называется «{name}», используется он")
+        return str(_ETPGPB_FEED_CACHE["search_param"])
+    return "search"
+
+
+def _etpgpb_html_url(keyword: str, page: int) -> str:
+    """Адрес страницы «Поиск по торгам» с теми же фильтрами, что у RSS-канала."""
+    search_param = str(_ETPGPB_FEED_CACHE.get("search_param") or "search")
+    params = {"procedure[category]": "actual", search_param: keyword, "sort": "by_published_desc"}
+    if page > 1:
+        params["page"] = str(page)
+    return ETPGPB_SEARCH_URL + "?" + urlencode(params)
 
 
 def build_etpgpb_rss_url(keyword: str, page: int, base: str = "") -> str:
@@ -2232,40 +2318,23 @@ def enrich_etpgpb_detail(t: Tender, page: bytes):
     return t
 
 
-def collect_etpgpb(date_from: str, date_to: str, region_name: str, customer_filter: str,
-                   keywords: list[str], active_only: bool, progress: Callable[[str], None],
-                   stop_event: threading.Event, enrich: bool = False,
-                   exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None,
-                   insecure: bool = False) -> list[Tender]:
-    """Собирает закупки на ЭТП ГПБ (etpgpb.ru) через официальный RSS-канал.
+def _collect_etpgpb_feed_items(
+    dl: Downloader, feed_base: str, keywords: list[str],
+    d1: datetime | None, d2: datetime | None, customer_filter: str,
+    exclude_pattern: re.Pattern | None,
+    progress: Callable[[str], None], stop_event: threading.Event,
+) -> tuple[list[Tender], int]:
+    """Опрос RSS-канала по всем фразам. Возвращает (записи, сколько записей всего отдал канал).
 
-    Площадка публикует открытый RSS по любым фильтрам страницы «Поиск по
-    торгам», поэтому отдельный браузер, как для ТЭК-Торг, не нужен. Сам адрес
-    канала подбирается при первом запросе (etpgpb_find_feed_url): в сентябре
-    2026 года /procedures.rss отдавал 404, и поиск по всем фразам валился
-    предупреждениями. Канал
-    возвращает только актуальные процедуры (procedure[category]=actual),
-    поэтому флажок «Только этап "Подача заявок"» выполняется самой площадкой.
-    Регион в RSS отсутствует: при выбранном регионе (или включённом уточнении)
-    карточки открываются в обычном HTTP-режиме, без загрузки вложений.
+    Счётчики нужны диагностике: программа обязана показать, на каком шаге
+    теряются записи — канал не отдал ничего, отбросили даты или фильтр
+    перевозки. Раньше «новых подходящих 0» мог означать любое из трёх.
     """
-    dl = Downloader(insecure=insecure, source=ETPGPB_NAME)
     unique: dict[str, Tender] = {}
-    exclude_pattern = _compile_exclude_pattern(exclude_keywords)
-    d1, d2 = parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)
-    if not keywords:
-        return []
-    # Адрес канала определяется один раз на запуск: раньше при 404 все фразы
-    # получали по три повтора и по запасному запросу через PowerShell.
-    feed_base = etpgpb_find_feed_url(dl, keywords[0], progress)
-    if not feed_base:
-        progress(
-            f"ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: рабочий RSS-канал не найден — площадка изменила адрес. "
-            f"Откройте {ETPGPB_SEARCH_URL}/, выполните поиск и добавьте к адресу страницы «.rss»; "
-            f"получившуюся ссылку впишите в файл {ETPGPB_FEED_FILE} рядом с программой. "
-            f"Площадка пропущена, остальные источники работают."
-        )
-        return []
+    received_total = 0
+    dropped_date = 0
+    dropped_filter = 0
+    dropped_examples: list[str] = []
     consecutive_failures = 0
     for ki, keyword in enumerate(keywords, 1):
         if stop_event.is_set():
@@ -2292,9 +2361,142 @@ def collect_etpgpb(date_from: str, date_to: str, region_name: str, customer_filt
             if not rows:
                 progress(f"ЭТП ГПБ: по запросу «{keyword}» записи не получены")
                 break
+            received_total += len(rows)
             signature = tuple(t.etp_url for t in rows)
             if signature in page_signatures:
                 # Площадка проигнорировала номер страницы — записи начали повторяться.
+                progress("ЭТП ГПБ: страница повторилась, переход к следующему запросу")
+                break
+            page_signatures.add(signature)
+            added = 0
+            for t in rows:
+                if t.etp_url in seen_links:
+                    continue
+                seen_links.add(t.etp_url)
+                pub = parse_ddmmyyyy(t.published)
+                if pub and ((d1 and pub < d1) or (d2 and pub > d2)):
+                    dropped_date += 1
+                    continue
+                if not matches_road_transport(t, exclude_pattern):
+                    dropped_filter += 1
+                    if len(dropped_examples) < 2:
+                        dropped_examples.append(t.title[:110])
+                    continue
+                if customer_filter and customer_filter.lower() not in t.customer.lower():
+                    continue
+                key = "etpgpb:" + (t.number or t.etp_url)
+                existing = unique.get(key)
+                if existing:
+                    if t.matched_keyword and t.matched_keyword not in existing.matched_keyword:
+                        existing.matched_keyword = "; ".join(x for x in
+                                                             (existing.matched_keyword, t.matched_keyword) if x)
+                else:
+                    unique[key] = t
+                    added += 1
+            progress(f"ЭТП ГПБ, «{keyword}»: страница {page}, получено {len(rows)}, "
+                     f"новых подходящих {added}, всего {len(unique)}")
+            time.sleep(0.1)
+        if consecutive_failures >= 3:
+            # Три фразы подряд без ответа — адрес канала, скорее всего, снова
+            # переехал. Оставшиеся фразы не опрашиваем (раньше на них уходило
+            # по полчаса), кэш сбрасываем: следующий запуск подберёт адрес заново.
+            _ETPGPB_FEED_CACHE.pop("base", None)
+            progress("ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: канал не отвечает трижды подряд — адрес "
+                     "площадки, вероятно, изменился. Остальные фразы по этой площадке не "
+                     "опрашиваются, уже собранные записи сохранены.")
+            break
+    if not unique and received_total and not stop_event.is_set():
+        progress(f"ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: канал отдал {received_total} записей, но ни одна "
+                 f"не подошла (по датам отброшено {dropped_date}, фильтром перевозки — {dropped_filter}).")
+        for example in dropped_examples:
+            progress(f"ЭТП ГПБ: пример отброшенной записи: «{example}»")
+    return list(unique.values()), received_total
+
+
+def parse_etpgpb_html_search(page: bytes, keyword: str, base_url: str = ETPGPB) -> list[Tender]:
+    """Разбирает страницу «Поиск по торгам» ЭТП ГПБ — резервный путь при мёртвом RSS.
+
+    Таблица выдачи: «Наименование и номер | Заказчик | Прием заявок | Цена, руб.».
+    Разбор нарочито терпимый: берётся любая строка со ссылкой на /procedure/,
+    так смена классов оформления площадку не спасает. Даты публикации в таблице
+    нет, поэтому ограничение по датам применяется после уточнения карточек.
+    """
+    soup = BeautifulSoup(page, "html.parser")
+    rows: list[Tender] = []
+    seen_in_page: set[str] = set()
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all("td")
+        if not cells:
+            continue
+        a = cells[0].find("a", href=True)
+        if not a:
+            continue
+        href = (a.get("href") or "").strip()
+        parsed = urlparse(href)
+        if "/procedure" not in parsed.path.lower() and "etpgpb" not in parsed.netloc.lower():
+            continue
+        link = urljoin(base_url + "/", href)
+        if link in seen_in_page:
+            continue
+        seen_in_page.add(link)
+        title_raw = clean_text(cells[0].get_text(" ", strip=True))
+        if not title_raw:
+            continue
+        name, _, _ = _split_etpgpb_title(title_raw)
+        number = _etpgpb_number(name, link)
+        if number and name.startswith(number):
+            name = name[len(number):].lstrip(" .:;-–—")
+        customer = clean_text(cells[1].get_text(" ", strip=True)) if len(cells) > 1 else ""
+        deadline = ""
+        if len(cells) > 2:
+            m = re.search(r"\d{2}\.\d{2}\.\d{4}", cells[2].get_text(" ", strip=True))
+            if m:
+                deadline = normalize_date(m.group(0))
+        price = None
+        for cell in cells[3:]:
+            price = parse_price(clean_text(cell.get_text(" ", strip=True)))
+            if price:
+                break
+        rows.append(Tender(
+            number=number, title=name,
+            transport=extract_transport_name(name), nmck=price,
+            published="", customer=customer, deadline=deadline,
+            law=_etpgpb_law(link), status="",
+            procedure=_etpgpb_procedure(link), etp=ETPGPB_NAME, etp_url=link,
+            matched_keyword=keyword,
+        ))
+    return rows
+
+
+def _collect_etpgpb_html_items(
+    dl: Downloader, keywords: list[str],
+    d1: datetime | None, d2: datetime | None, customer_filter: str,
+    exclude_pattern: re.Pattern | None,
+    progress: Callable[[str], None], stop_event: threading.Event,
+) -> list[Tender]:
+    """Резервный сбор со страницы «Поиск по торгам», если RSS не отвечает или пуст."""
+    unique: dict[str, Tender] = {}
+    received_total = 0
+    for ki, keyword in enumerate(keywords, 1):
+        if stop_event.is_set():
+            break
+        progress(f"ЭТП ГПБ (страница поиска), запрос {ki}/{len(keywords)}: {keyword}")
+        seen_links: set[str] = set()
+        page_signatures: set[tuple[str, ...]] = set()
+        for page in range(1, 4):
+            if stop_event.is_set():
+                break
+            try:
+                rows = parse_etpgpb_html_search(dl.get(_etpgpb_html_url(keyword, page)), keyword)
+            except Exception as exc:
+                progress(f"ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ, «{keyword}»: {exc}")
+                break
+            if not rows:
+                progress(f"ЭТП ГПБ: на странице поиска по запросу «{keyword}» записи не найдены")
+                break
+            received_total += len(rows)
+            signature = tuple(t.etp_url for t in rows)
+            if signature in page_signatures:
                 progress("ЭТП ГПБ: страница повторилась, переход к следующему запросу")
                 break
             page_signatures.add(signature)
@@ -2311,28 +2513,23 @@ def collect_etpgpb(date_from: str, date_to: str, region_name: str, customer_filt
                 if customer_filter and customer_filter.lower() not in t.customer.lower():
                     continue
                 key = "etpgpb:" + (t.number or t.etp_url)
-                existing = unique.get(key)
-                if existing:
-                    if t.matched_keyword and t.matched_keyword not in existing.matched_keyword:
-                        existing.matched_keyword = "; ".join(x for x in
-                                                             (existing.matched_keyword, t.matched_keyword) if x)
-                else:
-                    unique[key] = t
-                    added += 1
-            progress(f"ЭТП ГПБ, «{keyword}»: страница {page}, новых подходящих {added}, всего {len(unique)}")
-            time.sleep(0.1)
-        if consecutive_failures >= 3:
-            # Три фразы подряд без ответа — адрес канала, скорее всего, снова
-            # переехал. Оставшиеся фразы не опрашиваем (раньше на них уходило
-            # по полчаса), кэш сбрасываем: следующий запуск подберёт адрес заново.
-            _ETPGPB_FEED_CACHE.pop("base", None)
-            progress("ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: канал не отвечает трижды подряд — адрес "
-                     "площадки, вероятно, изменился. Остальные фразы по этой площадке не "
-                     "опрашиваются, уже собранные записи сохранены.")
-            break
-    items = list(unique.values())
-    # Срок подачи и регион в RSS отсутствуют — при необходимости открываем
-    # HTML-карточку (обычный запрос без вложений, как у ТЭК-Торг).
+                if key in unique:
+                    continue
+                unique[key] = t
+                added += 1
+            progress(f"ЭТП ГПБ, «{keyword}»: страница {page}, найдено {len(rows)}, "
+                     f"новых подходящих {added}, всего {len(unique)}")
+            time.sleep(0.2)
+    if not unique and not received_total and not stop_event.is_set():
+        progress("ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: страница поиска не отдала ни одной строки — "
+                 "площадка, вероятно, изменила разметку. Проверьте вручную: "
+                 f"{ETPGPB_SEARCH_URL}/")
+    return list(unique.values())
+
+
+def _etpgpb_finalize(dl: Downloader, items: list[Tender], region_name: str, enrich: bool,
+                     progress: Callable[[str], None], stop_event: threading.Event) -> list[Tender]:
+    """Уточнение карточек (срок подачи, регион) и отсечение по региону."""
     if (enrich or region_name != "Все регионы") and items:
         for i, t in enumerate(items, 1):
             if stop_event.is_set():
@@ -2348,6 +2545,70 @@ def collect_etpgpb(date_from: str, date_to: str, region_name: str, customer_filt
         target = region_name.lower().replace(" — ", " ")
         items = [t for t in items if not t.region or target.split()[0] in t.region.lower()]
     return items
+
+
+def collect_etpgpb(date_from: str, date_to: str, region_name: str, customer_filter: str,
+                   keywords: list[str], active_only: bool, progress: Callable[[str], None],
+                   stop_event: threading.Event, enrich: bool = False,
+                   exclude_keywords: list[str] | tuple[str, ...] | re.Pattern | None = None,
+                   insecure: bool = False) -> list[Tender]:
+    """Собирает закупки на ЭТП ГПБ (etpgpb.ru) через официальный RSS-канал.
+
+    Площадка публикует открытый RSS по любым фильтрам страницы «Поиск по
+    торгам», поэтому отдельный браузер, как для ТЭК-Торг, не нужен. Адрес
+    канала подбирается при первом запросе (etpgpb_find_feed_url). Если канал
+    не найден или не отдал ни одной записи по всем фразам, автоматически
+    включается резервный путь — разбор самой страницы поиска. Имена поискового
+    параметра тоже подбираются автоматически: молчаливая смена «search» на
+    другое имя выглядела как «поиск не находит тендеры».
+
+    Канал возвращает только актуальные процедуры (procedure[category]=actual),
+    поэтому флажок «Только этап "Подача заявок"» выполняется самой площадкой.
+    Регион в RSS отсутствует: при выбранном регионе (или включённом уточнении)
+    карточки открываются в обычном HTTP-режиме, без загрузки вложений.
+    """
+    dl = Downloader(insecure=insecure, source=ETPGPB_NAME)
+    exclude_pattern = _compile_exclude_pattern(exclude_keywords)
+    d1, d2 = parse_ddmmyyyy(date_from), parse_ddmmyyyy(date_to)
+    if not keywords:
+        return []
+    # Адрес канала определяется один раз на запуск: раньше при 404 все фразы
+    # получали по три повтора и по запасному запросу через PowerShell.
+    feed_base = etpgpb_find_feed_url(dl, keywords[0], progress)
+    items: list[Tender] = []
+    received = 0
+    if feed_base:
+        items, received = _collect_etpgpb_feed_items(
+            dl, feed_base, keywords, d1, d2, customer_filter,
+            exclude_pattern, progress, stop_event)
+        if not items and not received and not stop_event.is_set():
+            # Канал жив, но по всем фразам отдал пусто: вероятная причина —
+            # площадка переименовала поисковый параметр. Узнаём имя поля
+            # со страницы поиска и повторяемRSS с правильным именем.
+            param = _etpgpb_discover_search_param(dl, progress)
+            if param and param != "search":
+                progress(f"ЭТП ГПБ: повтор запросов с поисковым параметром «{param}»")
+                items, received = _collect_etpgpb_feed_items(
+                    dl, feed_base, keywords, d1, d2, customer_filter,
+                    exclude_pattern, progress, stop_event)
+        if items or received or stop_event.is_set():
+            return _etpgpb_finalize(dl, items, region_name, enrich, progress, stop_event)
+    if not stop_event.is_set():
+        if feed_base:
+            progress("ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: RSS-канал отвечает, но записей не вернул. "
+                     f"Включаю резервный путь — разбор страницы поиска {ETPGPB_SEARCH_URL}/")
+        else:
+            progress(
+                f"ПРЕДУПРЕЖДЕНИЕ ЭТП ГПБ: рабочий RSS-канал не найден — площадка изменила адрес. "
+                f"Записи собираются через страницу поиска (резервный путь). Если и она пуста: "
+                f"откройте {ETPGPB_SEARCH_URL}/, выполните поиск и добавьте к адресу страницы «.rss»; "
+                f"получившуюся ссылку впишите в файл {ETPGPB_FEED_FILE} рядом с программой."
+            )
+        if feed_base:
+            _etpgpb_discover_search_param(dl, progress)
+        items = _collect_etpgpb_html_items(
+            dl, keywords, d1, d2, customer_filter, exclude_pattern, progress, stop_event)
+    return _etpgpb_finalize(dl, items, region_name, enrich, progress, stop_event)
 
 
 def build_rss_url(keyword: str, date_from: str, date_to: str, region_code: str, page: int, active_only: bool) -> str:
